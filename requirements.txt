@@ -1,0 +1,18 @@
+# PyDuo Requirements
+
+# Core dependencies
+numpy>=1.20.0
+
+# GPU acceleration (optional, but recommended)
+# Install with: pip install cupy-cuda11x (for CUDA 11.x)
+# or: pip install cupy-cuda12x (for CUDA 12.x)
+cupy-cuda13x
+# cupy>=12.0.0
+
+# Optional dependencies for extended functionality
+scipy>=1.7.0  # For advanced eigensolvers and interpolation
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# mypy>=0.990

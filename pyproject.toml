@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyduo"
+version = "0.1.0"
+description = "GPU-accelerated diatomic rovibronic calculations"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "PyDuo Contributors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda13x"]
+full = ["cupy-cuda13x", "scipy>=1.7.0"]
+dev = ["pytest>=7.0.0", "black>=22.0.0", "mypy>=0.990"]
+
+[project.scripts]
+pyduo = "pyduo.duo:main"
+
+[project.urls]
+Homepage = "https://github.com/ExoMol/Duo"
+Repository = "https://github.com/ExoMol/Duo"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pyduo*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py38", "py39", "py310", "py311"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
