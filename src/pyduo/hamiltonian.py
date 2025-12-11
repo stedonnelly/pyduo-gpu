@@ -1423,51 +1423,84 @@ class HamiltonianBuilder:
                         iswap[i] = i + 1
 
             # =====================================================
-            # Build parity blocks and transform
-            # Also build direct quantum number mapping for each symmetrized level
+            # Build parity blocks and transform - EXACTLY matching Duo
+            # Build ilevel2i[ilevel, irrep] and irec[isym] = ilevel mappings
             # =====================================================
-            pos_levels = []
-            neg_levels = []
-            pos_quanta = []  # Quantum numbers for positive parity levels
-            neg_quanta = []  # Quantum numbers for negative parity levels
+            Nlevels = len(levels)
 
-            for level in levels:
+            # ilevel2i[ilevel][irrep] = index in valid_basis
+            # Duo: ilevel2i(Nlevels, 2) where irrep=1 is positive, irrep=2 is negative
+            ilevel2i = [[None, None] for _ in range(Nlevels)]
+
+            # Nirr[ilevel][irrep] = 1 if level contributes to this irrep, 0 otherwise
+            Nirr = [[0, 0] for _ in range(Nlevels)]
+
+            # tau[ilevel] = parity phase factor
+            tau_arr = [1.0] * Nlevels
+
+            for ilevel, level in enumerate(levels):
                 indices = level['indices']
                 nirr = level['nirr']
-                tau = level['tau']
+                tau_arr[ilevel] = level['tau']
+                Nirr[ilevel] = nirr
 
                 if len(indices) == 1:
+                    # Single state - only contributes to one parity
                     idx = indices[0]
-                    basis_state = valid_basis[idx]
-                    if nirr[0] == 1:
-                        pos_levels.append({'idx': idx, 'single': True})
-                        pos_quanta.append(basis_state)
-                    else:
-                        neg_levels.append({'idx': idx, 'single': True})
-                        neg_quanta.append(basis_state)
+                    if nirr[0] == 1:  # Positive parity only
+                        ilevel2i[ilevel][0] = idx
+                    else:  # Negative parity only
+                        ilevel2i[ilevel][1] = idx
                 else:
+                    # Paired states - contribute to both parities
                     idx_pos, idx_neg = indices
-                    pos_levels.append({
-                        'idx_pos': idx_pos,
-                        'idx_neg': idx_neg,
-                        'tau': tau,
-                        'single': False
-                    })
-                    pos_quanta.append(valid_basis[idx_pos])
-                    neg_levels.append({
-                        'idx_pos': idx_pos,
-                        'idx_neg': idx_neg,
-                        'tau': tau,
-                        'single': False
-                    })
-                    neg_quanta.append(valid_basis[idx_neg])
+                    ilevel2i[ilevel][0] = idx_pos  # Positive parity gets Lambda>0 component
+                    ilevel2i[ilevel][1] = idx_neg  # Negative parity gets Lambda<0 component
+
+            # Build block structures for each parity
+            # irec[isym] = ilevel - maps symmetrized index back to level
+            pos_levels = []
+            neg_levels = []
+            irec_pos = []  # irec[isym] = ilevel for positive parity
+            irec_neg = []  # irec[isym] = ilevel for negative parity
+
+            for ilevel in range(Nlevels):
+                if Nirr[ilevel][0] == 1:  # Contributes to positive parity
+                    isym_pos = len(pos_levels)
+                    irec_pos.append(ilevel)
+                    idx = ilevel2i[ilevel][0]
+                    if len(levels[ilevel]['indices']) == 1:
+                        pos_levels.append({'idx': idx, 'single': True, 'ilevel': ilevel})
+                    else:
+                        pos_levels.append({
+                            'idx_pos': levels[ilevel]['indices'][0],
+                            'idx_neg': levels[ilevel]['indices'][1],
+                            'tau': tau_arr[ilevel],
+                            'single': False,
+                            'ilevel': ilevel
+                        })
+
+                if Nirr[ilevel][1] == 1:  # Contributes to negative parity
+                    isym_neg = len(neg_levels)
+                    irec_neg.append(ilevel)
+                    idx = ilevel2i[ilevel][1]
+                    if len(levels[ilevel]['indices']) == 1:
+                        neg_levels.append({'idx': idx, 'single': True, 'ilevel': ilevel})
+                    else:
+                        neg_levels.append({
+                            'idx_pos': levels[ilevel]['indices'][0],
+                            'idx_neg': levels[ilevel]['indices'][1],
+                            'tau': tau_arr[ilevel],
+                            'single': False,
+                            'ilevel': ilevel
+                        })
 
             # =====================================================
             # Diagonalize each parity block
             # =====================================================
-            for irrep, (block_levels, block_quanta, parity_char) in enumerate([
-                (pos_levels, pos_quanta, '+'),
-                (neg_levels, neg_quanta, '-')
+            for irrep, (block_levels, irec, parity_char) in enumerate([
+                (pos_levels, irec_pos, '+'),
+                (neg_levels, irec_neg, '-')
             ]):
                 if len(block_levels) == 0:
                     continue
@@ -1475,30 +1508,30 @@ class HamiltonianBuilder:
                 Nblock = len(block_levels)
                 hsym = np.zeros((Nblock, Nblock), dtype=np.float64)
 
-                for ilevel, level_i in enumerate(block_levels):
-                    for jlevel, level_j in enumerate(block_levels):
+                for isym_i, level_i in enumerate(block_levels):
+                    for isym_j, level_j in enumerate(block_levels):
                         if level_i['single'] and level_j['single']:
                             i = level_i['idx']
                             j = level_j['idx']
-                            hsym[ilevel, jlevel] = hmat_j[i, j]
+                            hsym[isym_i, isym_j] = hmat_j[i, j]
 
                         elif level_i['single'] and not level_j['single']:
                             i = level_i['idx']
                             jp, jn = level_j['idx_pos'], level_j['idx_neg']
                             tauj = level_j['tau']
                             if irrep == 0:
-                                hsym[ilevel, jlevel] = (hmat_j[i, jp] + tauj * hmat_j[i, jn]) / np.sqrt(2)
+                                hsym[isym_i, isym_j] = (hmat_j[i, jp] + tauj * hmat_j[i, jn]) / np.sqrt(2)
                             else:
-                                hsym[ilevel, jlevel] = (hmat_j[i, jp] - tauj * hmat_j[i, jn]) / np.sqrt(2)
+                                hsym[isym_i, isym_j] = (hmat_j[i, jp] - tauj * hmat_j[i, jn]) / np.sqrt(2)
 
                         elif not level_i['single'] and level_j['single']:
                             ip, in_ = level_i['idx_pos'], level_i['idx_neg']
                             taui = level_i['tau']
                             j = level_j['idx']
                             if irrep == 0:
-                                hsym[ilevel, jlevel] = (hmat_j[ip, j] + taui * hmat_j[in_, j]) / np.sqrt(2)
+                                hsym[isym_i, isym_j] = (hmat_j[ip, j] + taui * hmat_j[in_, j]) / np.sqrt(2)
                             else:
-                                hsym[ilevel, jlevel] = (hmat_j[ip, j] - taui * hmat_j[in_, j]) / np.sqrt(2)
+                                hsym[isym_i, isym_j] = (hmat_j[ip, j] - taui * hmat_j[in_, j]) / np.sqrt(2)
 
                         else:
                             ip, in_ = level_i['idx_pos'], level_i['idx_neg']
@@ -1507,12 +1540,12 @@ class HamiltonianBuilder:
                             tauj = level_j['tau']
 
                             if irrep == 0:
-                                hsym[ilevel, jlevel] = 0.5 * (
+                                hsym[isym_i, isym_j] = 0.5 * (
                                     hmat_j[ip, jp] + taui * hmat_j[in_, jp] +
                                     tauj * hmat_j[ip, jn] + taui * tauj * hmat_j[in_, jn]
                                 )
                             else:
-                                hsym[ilevel, jlevel] = 0.5 * (
+                                hsym[isym_i, isym_j] = 0.5 * (
                                     hmat_j[ip, jp] - taui * hmat_j[in_, jp] -
                                     tauj * hmat_j[ip, jn] + taui * tauj * hmat_j[in_, jn]
                                 )
@@ -1526,9 +1559,10 @@ class HamiltonianBuilder:
                 eigenvalues_np = eigenvalues / sc
                 eigenvectors_np = eigenvectors
 
-                # Assign quantum numbers using EXACTLY Duo's approach:
-                # imaxcontr = argmax of coefficient^2, with duplicate avoidance
-                # This matches Duo's diatom.f90 lines 10015-10052
+                # =====================================================
+                # Assign quantum numbers - EXACTLY matching Duo
+                # Duo diatom.f90 lines 10015-10092
+                # =====================================================
                 QNs = [None] * len(eigenvalues_np)
                 small_ = 1e-12
 
@@ -1537,36 +1571,32 @@ class HamiltonianBuilder:
                     coeffs = eigenvectors_np[:, iroot]
                     coeffs_sq = coeffs ** 2
 
-                    # Find largest coefficient (Duo: maxloc)
-                    # Use tolerance-based tie-breaking to match Fortran's maxloc
-                    tol = 1e-6
-                    max_val = np.max(coeffs_sq)
-                    if max_val > 0:
-                        near_max_mask = coeffs_sq >= max_val * (1.0 - tol)
-                        near_max_indices = np.where(near_max_mask)[0]
-                        imaxcontr = int(near_max_indices[0])
+                    # Duo: imaxcontr = maxloc(hsym(:,i)**2, mask=hsym(:,i)**2 >= small_)
+                    # Find largest coefficient that's above threshold
+                    valid_mask = coeffs_sq >= small_
+                    if np.any(valid_mask):
+                        masked_coeffs = np.where(valid_mask, coeffs_sq, -np.inf)
+                        imaxcontr = int(np.argmax(masked_coeffs))
                     else:
                         imaxcontr = int(np.argmax(coeffs_sq))
                     maxcontr = coeffs_sq[imaxcontr]
 
-                    # Check if already used, take second largest if so (Duo's loop_check)
+                    # Duo: loop_check - check if this imaxcontr was already used
                     i0 = 0
                     while True:
                         found_duplicate = False
                         for ilevel_prev in range(iroot):
                             if QNs[ilevel_prev] is not None and imaxcontr == QNs[ilevel_prev]:
-                                # Find next largest that's smaller than current max
-                                mask2 = (coeffs_sq >= small_) & (coeffs_sq < maxcontr)
+                                # Find next largest: mask = (>= small_) AND (< current maxcontr)
+                                mask2 = valid_mask & (coeffs_sq < maxcontr)
                                 if np.any(mask2):
                                     masked_coeffs2 = np.where(mask2, coeffs_sq, -np.inf)
-                                    max_val2 = np.max(masked_coeffs2)
-                                    near_max_mask2 = masked_coeffs2 >= max_val2 * (1.0 - tol)
-                                    near_max_indices2 = np.where(near_max_mask2)[0]
-                                    imaxcontr = int(near_max_indices2[0])
+                                    imaxcontr = int(np.argmax(masked_coeffs2))
                                     maxcontr = coeffs_sq[imaxcontr]
                                 i0 += 1
                                 if i0 > 10:
-                                    imaxcontr = int(np.argmax(coeffs_sq))
+                                    # Give up and take overall max
+                                    imaxcontr = int(np.argmax(np.where(valid_mask, coeffs_sq, -np.inf)))
                                     break
                                 found_duplicate = True
                                 break
@@ -1574,7 +1604,13 @@ class HamiltonianBuilder:
                             break
 
                     QNs[iroot] = imaxcontr
-                    basis_state = block_quanta[imaxcontr]
+
+                    # Duo: mlevel = transform(irrep)%irec(imaxcontr)
+                    #      mterm = ilevel2i(mlevel, irrep)
+                    #      quantum numbers from icontr(mterm)
+                    mlevel = irec[imaxcontr]
+                    mterm = ilevel2i[mlevel][irrep]
+                    basis_state = valid_basis[mterm]
 
                     eigenstate = EigenState(
                         energy=energy,
