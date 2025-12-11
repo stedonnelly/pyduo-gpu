@@ -320,7 +320,8 @@ class HamiltonianBuilder:
         all_energies = []
         all_wavefunctions = []
 
-        total_roots = 0
+        # First pass: compute all vibrational solutions and store nmax per state
+        vib_solutions = {}  # istate -> (eigenvalues, eigenvectors, nmax)
 
         for istate, state in enumerate(self.states):
             eigenvalues, eigenvectors = self.build_vibrational_hamiltonian(istate)
@@ -334,49 +335,67 @@ class HamiltonianBuilder:
                 nmax = min(nmax, int(np.sum(eigenvalues - eigenvalues[0] <= emax)))
 
             nmax = max(1, nmax)  # At least one state
+            vib_solutions[state.istate] = (eigenvalues, eigenvectors, nmax)
 
-            # Get parity of state from input (defaults to +1)
+        # Build "quanta" list: (istate, tau, sigma) like Duo's ilevel ordering
+        # This is Duo's sigma-lambda basis set ordering
+        quanta_list = []
+        for state in self.states:
             parity_pm = getattr(state, 'parity_pm', 0)
             if parity_pm == 0:
-                parity_pm = 1  # Default to +1 if not set
+                parity_pm = 1
 
-            # Store contracted basis states
+            taumax = 1 if state.lambda_ != 0 else 0
+            for itau in range(taumax + 1):
+                ilambda = ((-1) ** itau) * state.lambda_
+                for imulti in range(state.multiplicity):
+                    sigma = -state.spin + imulti
+                    omega = ilambda + sigma
+                    quanta_list.append({
+                        'istate': state.istate,
+                        'ilambda': ilambda,
+                        'sigma': sigma,
+                        'omega': omega,
+                        'spin': state.spin,
+                        'imulti': imulti + 1,
+                        'name': state.name,
+                        'parity_pm': parity_pm
+                    })
+
+        # Build contracted basis in Duo's order: (ilevel, ivib)
+        # Outer loop: ilevel (sigma-lambda quantum numbers)
+        # Inner loop: ivib (vibrational states)
+        total_roots = 0
+        ivib_map = {}  # (istate, v) -> ivib index for wavefunction lookup
+
+        for quanta in quanta_list:
+            istate = quanta['istate']
+            eigenvalues, eigenvectors, nmax = vib_solutions[istate]
+
             for v in range(nmax):
-                # For each spin component
-                spin = state.spin
-                vib_index = total_roots  # Same vibrational wavefunction for all spin components
+                # Track vibrational wavefunction index
+                key = (istate, v)
+                if key not in ivib_map:
+                    ivib_map[key] = total_roots
+                    all_energies.append(eigenvalues[v])
+                    all_wavefunctions.append(eigenvectors[:, v])
+                    total_roots += 1
 
-                # For non-Sigma states, loop over both +lambda and -lambda (tau=0,1)
-                # For Sigma states (lambda=0), only tau=0
-                taumax = 1 if state.lambda_ != 0 else 0
+                vib_index = ivib_map[key]
 
-                for itau in range(taumax + 1):
-                    # ilambda = (-1)^itau * lambda (matches Fortran convention)
-                    ilambda = ((-1) ** itau) * state.lambda_
-
-                    # Sigma starts at -spin and increments
-                    for imulti in range(state.multiplicity):
-                        sigma = -spin + imulti
-                        omega = ilambda + sigma
-
-                        basis_state = BasisState(
-                            istate=state.istate,  # Use actual state index from input, not enumerate index
-                            v=v,
-                            ivib=vib_index,  # Points to the vibrational wavefunction
-                            lambda_=ilambda,
-                            sigma=sigma,
-                            omega=omega,
-                            spin=spin,
-                            imulti=imulti + 1,
-                            name=state.name,
-                            parity_pm=parity_pm  # Store electronic state parity
-                        )
-                        self.contracted_basis.append(basis_state)
-
-                # Only store the vibrational wavefunction once per v
-                all_energies.append(eigenvalues[v])
-                all_wavefunctions.append(eigenvectors[:, v])
-                total_roots += 1
+                basis_state = BasisState(
+                    istate=istate,
+                    v=v,
+                    ivib=vib_index,
+                    lambda_=quanta['ilambda'],
+                    sigma=quanta['sigma'],
+                    omega=quanta['omega'],
+                    spin=quanta['spin'],
+                    imulti=quanta['imulti'],
+                    name=quanta['name'],
+                    parity_pm=quanta['parity_pm']
+                )
+                self.contracted_basis.append(basis_state)
 
         self.contracted_energies = np.array(all_energies)
         self.contracted_wavefunctions = np.array(all_wavefunctions).T  # (ngrid, nstates)
@@ -661,15 +680,13 @@ class HamiltonianBuilder:
 
     def solve_all_J_batched(self, j_list: List[float]) -> List[EigenState]:
         """
-        Solve the rovibronic problem for ALL J values simultaneously using GPU batching.
+        Solve the rovibronic problem for ALL J values with proper parity separation.
 
-        TRUE PARALLELISM: 100 J values takes ~same time as 1 J value.
-
-        This achieves massive speedup by:
-        1. Building all Hamiltonians using fully vectorized 3D tensor operations
-        2. NO Python loops over J values for Hamiltonian construction
-        3. Using CUDA streams for parallel eigendecomposition
-        4. Keeping everything on GPU until final results
+        This method:
+        1. Builds the unsymmetrized Hamiltonian for each J using GPU batching
+        2. Applies symmetry transformation to separate + and - parity blocks
+        3. Diagonalizes each parity block separately
+        4. Returns eigenstates with correct parity assignments
 
         Parameters
         ----------
@@ -679,7 +696,7 @@ class HamiltonianBuilder:
         Returns
         -------
         List[EigenState]
-            All eigenstates for all J values, sorted by energy
+            All eigenstates for all J values, sorted by (J, energy)
         """
         if not self.use_gpu:
             raise ValueError("Batched solver requires GPU. Initialize with use_gpu=True")
@@ -746,36 +763,53 @@ class HamiltonianBuilder:
         diag_idx = xp.arange(Nmax)
 
         # =====================================================
-        # DIAGONAL TERMS (fully vectorized - NO LOOPS)
+        # DIAGONAL TERMS (vibrational energy only - truly diagonal)
         # =====================================================
 
         # Vibrational energy: (N,) -> broadcast to (nJ, N)
         vib_energies = self._energies_gpu[ivib_arr] * sc  # (N,)
         hmat_batch[:, diag_idx, diag_idx] = vib_energies[None, :]  # (nJ, N)
 
-        # J-independent rotational: B[v,v] * [-Omega^2 - Lambda^2 + S(S+1) - Sigma^2]
-        brot_diag = self._brot_matelem_gpu[ivib_arr, ivib_arr]  # (N,)
-        j_indep_rot = brot_diag * (-omega_arr**2 - lambda_arr**2 +
-                                   spin_arr * (spin_arr + 1) - sigma_arr**2)  # (N,)
-        hmat_batch[:, diag_idx, diag_idx] += j_indep_rot[None, :]  # broadcast to (nJ, N)
+        # =====================================================
+        # ROTATIONAL TERMS: DIAGONAL ONLY
+        # Duo line 10949-10955: rotational term is only added to diagonal (i==j)
+        # despite ilevel==jlevel allowing same (state, lambda, sigma) with different vib
+        # =====================================================
+        # Define selection masks (used here and below for S-uncoupling etc.)
+        same_state = (istate_i == istate_j)  # same electronic state
+        same_spin = (xp.abs(spin_i - spin_arr[j_grid]) < 0.5)  # same spin
 
-        # J-dependent rotational: B[v,v] * J(J+1)
-        # Use outer product: (nJ,) outer (N,) -> (nJ, N)
+        # Rotational energy: B[v,v] * [J(J+1) - Omega^2 - Lambda^2 + S(S+1) - Sigma^2]
+        # Only on diagonal elements (same basis state)
+        brot_diag = self._brot_matelem_gpu[ivib_arr, ivib_arr]  # (N,)
+
+        # J-independent rotational factor
+        j_indep_factor = (-omega_arr**2 - lambda_arr**2 +
+                          spin_arr * (spin_arr + 1) - sigma_arr**2)  # (N,)
+        j_indep_rot = brot_diag * j_indep_factor  # (N,)
+        hmat_batch[:, diag_idx, diag_idx] += j_indep_rot[None, :]  # (nJ, N)
+
+        # J-dependent rotational: B[v,v] * J(J+1) on diagonal only
         J_Jp1_1d = j_arr * (j_arr + 1)  # (nJ,)
         j_dep_rot = xp.outer(J_Jp1_1d, brot_diag)  # (nJ, N)
         hmat_batch[:, diag_idx, diag_idx] += j_dep_rot
 
         # =====================================================
         # S-UNCOUPLING (fully vectorized 3D tensor operation)
-        # Selection: Delta Lambda = 0, |Delta Sigma| = 1
+        # Selection: Delta Lambda = 0, |Delta Sigma| = 1, same electronic state, same spin
+        # (Duo line 11543: istate==jstate, ilambda==jlambda, |sigmai-sigmaj|==1, spini==spinj)
         # =====================================================
-        s_mask = (xp.abs(dlambda) < 0.5) & (xp.abs(xp.abs(dsigma) - 1.0) < 0.5)  # (N, N)
+        # same_state and same_spin already defined above
+        s_mask = same_state & same_spin & (xp.abs(dlambda) < 0.5) & (xp.abs(xp.abs(dsigma) - 1.0) < 0.5)  # (N, N)
 
         if xp.any(s_mask):
             brot_full = self._brot_matelem_gpu[ivib_i, ivib_j]  # (N, N)
-            f_s = xp.sign(dsigma)  # (N, N)
+            # Duo line 11547: f_s = sigmaj - sigmai (note: j - i, not i - j)
+            # dsigma = sigma_i - sigma_j, so f_s = -dsigma
+            f_s = -dsigma  # (N, N)
 
             # S+/S- factor (J-independent): (N, N)
+            # Duo line 11552: sqrt(spini*(spini+1) - sigmai*(sigmai + f_s))
             s_factor = xp.sqrt(xp.maximum(0, spin_i * (spin_i + 1) - sigma_i * (sigma_i + f_s)))
 
             # J-dependent factor: sqrt(J(J+1) - omega*(omega+f_s))
@@ -1087,14 +1121,19 @@ class HamiltonianBuilder:
             jstate_ss = ss_field.jstate
 
             # Create vectorized selection masks (N x N)
+            # Duo line 10969: spinspin(iss)%istate==istate AND spinspin(iss)%jstate==jstate AND istate==jstate
+            # AND it's inside ilevel==jlevel block meaning: same electronic state, same lambda, same sigma, same spin
             state_mask_i = (istate_i == istate_ss)  # (N, N)
             state_mask_j = (istate_j == jstate_ss)  # (N, N)
-            state_mask = state_mask_i & state_mask_j  # (N, N)
+            same_state = (istate_i == istate_j)  # Must be same electronic state (istate==jstate)
+            state_mask = state_mask_i & state_mask_j & same_state  # (N, N)
 
-            # Delta Sigma = 0
-            sigma_mask = xp.abs(sigma_i - sigma_j) < 0.5  # (N, N)
+            # Spin-spin is inside ilevel==jlevel block in Duo: same lambda, same sigma, same spin
+            sigma_mask = xp.abs(sigma_i - sigma_j) < 0.5  # Delta Sigma = 0
+            lambda_mask = xp.abs(lambda_i - lambda_j) < 0.5  # Delta Lambda = 0
+            spin_mask = xp.abs(spin_i - spin_arr[j_grid]) < 0.5  # Same spin
 
-            ss_mask = state_mask & sigma_mask  # (N, N)
+            ss_mask = state_mask & sigma_mask & lambda_mask & spin_mask  # (N, N)
 
             # Compute spin-spin term (vectorized)
             ss_vib_matrix = ss_matelem[ivib_i, ivib_j]  # (N, N)
@@ -1113,83 +1152,440 @@ class HamiltonianBuilder:
         hmat_batch += ss_contrib_total[None, :, :]  # (1, N, N) broadcasts to (nJ, N, N)
 
         # =====================================================
+        # SPIN-ROTATION COUPLING (J-independent) - FULLY VECTORIZED
+        # Duo line 10987-10993: <S, Sigma | H_SR | S, Sigma> = f_sr * [Sigma^2 - S(S+1)] * sc
+        # Selection: same electronic state, same lambda, same sigma, same spin (ilevel==jlevel)
+        # =====================================================
+
+        sr_contrib_total = xp.zeros((Nmax, Nmax), dtype=xp.float64)
+
+        for sr_idx, sr_field in enumerate(self.spinrot):
+            sr_matelem = self._sr_matelem_cache[sr_idx]
+            if sr_matelem is None:
+                continue
+
+            istate_sr = sr_field.istate
+            jstate_sr = sr_field.jstate
+
+            # Duo line 10988: spinrot(isr)%istate==istate AND spinrot(isr)%jstate==jstate AND istate==jstate
+            state_mask_i = (istate_i == istate_sr)
+            state_mask_j = (istate_j == jstate_sr)
+            same_state = (istate_i == istate_j)  # Must be same electronic state
+            state_mask = state_mask_i & state_mask_j & same_state
+
+            # Inside ilevel==jlevel block: same lambda, same sigma, same spin
+            sigma_mask = xp.abs(sigma_i - sigma_j) < 0.5
+            lambda_mask = xp.abs(lambda_i - lambda_j) < 0.5
+            spin_mask = xp.abs(spin_i - spin_arr[j_grid]) < 0.5
+
+            sr_mask = state_mask & sigma_mask & lambda_mask & spin_mask
+
+            # Compute spin-rotation term (vectorized)
+            sr_vib_matrix = sr_matelem[ivib_i, ivib_j]
+            sr_factor = sigma_i**2 - spin_i * (spin_i + 1)  # Duo line 10990
+            sr_contrib = sr_vib_matrix * sr_factor * sc
+            sr_contrib = xp.where(sr_mask, sr_contrib, 0.0)
+
+            # Symmetrize
+            sr_contrib = sr_contrib + sr_contrib.T
+            diag_sr = xp.diag(sr_contrib)
+            sr_contrib = sr_contrib - xp.diag(diag_sr / 2)
+
+            sr_contrib_total += sr_contrib
+
+        # Add SR to ALL J values via broadcasting
+        hmat_batch += sr_contrib_total[None, :, :]
+
+        # =====================================================
+        # BOB-VIB CORRECTION (J-independent) - FULLY VECTORIZED
+        # Duo line 10997-11016: adds correction to vibrational energy
+        # Selection: same electronic state (ilevel==jlevel block)
+        # =====================================================
+
+        bv_contrib_total = xp.zeros((Nmax, Nmax), dtype=xp.float64)
+
+        for bv_idx, bobvib_field in enumerate(self.bobvib):
+            bv_matelem = self._bobvib_matelem_cache[bv_idx]
+            if bv_matelem is None:
+                continue
+
+            istate_bv = bobvib_field.istate
+            jstate_bv = bobvib_field.jstate
+
+            # Duo: bobvib(ibobvib)%istate==istate AND bobvib(ibobvib)%jstate==jstate AND istate==jstate
+            state_mask_i = (istate_i == istate_bv)
+            state_mask_j = (istate_j == jstate_bv)
+            same_state = (istate_i == istate_j)
+            state_mask = state_mask_i & state_mask_j & same_state
+
+            # Inside ilevel==jlevel block
+            sigma_mask = xp.abs(sigma_i - sigma_j) < 0.5
+            lambda_mask = xp.abs(lambda_i - lambda_j) < 0.5
+            spin_mask = xp.abs(spin_i - spin_arr[j_grid]) < 0.5
+
+            bv_mask = state_mask & sigma_mask & lambda_mask & spin_mask
+
+            # BOB-vib is directly added (no factor, already has energy units)
+            bv_vib_matrix = bv_matelem[ivib_i, ivib_j]
+            bv_contrib = xp.where(bv_mask, bv_vib_matrix, 0.0)
+
+            # Symmetrize
+            bv_contrib = bv_contrib + bv_contrib.T
+            diag_bv = xp.diag(bv_contrib)
+            bv_contrib = bv_contrib - xp.diag(diag_bv / 2)
+
+            bv_contrib_total += bv_contrib
+
+        # Add BV to ALL J values via broadcasting
+        hmat_batch += bv_contrib_total[None, :, :]
+
+        # =====================================================
+        # BOB-ROT CORRECTION (J-dependent) - DIAGONAL ONLY
+        # Duo line 10932-10939: adds correction to f_rot (rotational constant)
+        # Like main rotational term, only applied to diagonal (i==j)
+        # =====================================================
+
+        # BOB-rot correction to rotational term
+        # In Duo: f_rot = brot%matelem + bobrot%matelem, then used in J(J+1) - Omega^2 - ... terms
+        # For diagonal: erot = f_rot * [J(J+1) - Omega^2 - Lambda^2 + S(S+1) - Sigma^2]
+
+        for bob_idx, bobrot_field in enumerate(self.bobrot):
+            bob_matelem = self._bobrot_matelem_cache[bob_idx]
+            if bob_matelem is None:
+                continue
+
+            istate_bob = bobrot_field.istate
+            jstate_bob = bobrot_field.jstate
+
+            # BOB-rot only for same electronic state
+            if istate_bob != jstate_bob:
+                continue
+
+            # State matching for diagonal elements only
+            state_mask = (istate_arr == istate_bob)  # (N,) - diagonal elements in this state
+
+            # BOB-rot adds to f_rot which is used in same way as brot
+            # bob_matelem is already scaled by b_rot/r^2*sc in precomputation
+            # Only diagonal vibrational elements: bob_matelem[v,v]
+            bob_diag = bob_matelem[ivib_arr, ivib_arr]  # (N,)
+
+            # J-independent part: -Omega^2 - Lambda^2 + S(S+1) - Sigma^2 (diagonal only)
+            j_indep_factor = -omega_arr**2 - lambda_arr**2 + spin_arr * (spin_arr + 1) - sigma_arr**2  # (N,)
+            bob_j_indep = xp.where(state_mask, bob_diag * j_indep_factor, 0.0)  # (N,)
+            hmat_batch[:, diag_idx, diag_idx] += bob_j_indep[None, :]
+
+            # J-dependent part: J(J+1) * bob_diag on diagonal only
+            bob_j_dep = xp.outer(J_Jp1_1d, xp.where(state_mask, bob_diag, 0.0))  # (nJ, N)
+            hmat_batch[:, diag_idx, diag_idx] += bob_j_dep
+
+        # =====================================================
         # VECTORIZED Hermitianization (no Python loop!)
         # =====================================================
         hmat_batch = (hmat_batch + hmat_batch.transpose(0, 2, 1)) / 2.0
 
         # =====================================================
-        # BATCHED EIGENVALUE DECOMPOSITION WITH CUDA STREAMS
+        # PARITY-SEPARATED EIGENVALUE DECOMPOSITION
         # =====================================================
-        # Use multiple CUDA streams to parallelize eigendecomposition across J values
-        # This allows multiple eigh operations to run concurrently on GPU
+        # For each J value:
+        # 1. Extract valid basis states (|omega| <= J)
+        # 2. Pair up states with opposite (lambda, sigma)
+        # 3. Build symmetry transformation
+        # 4. Transform to + and - parity blocks
+        # 5. Diagonalize each block separately
 
-        # Pre-compute valid indices and submatrices for each J
-        j_data = []
+        all_eigenstates = []
+
         for jidx in range(nJ):
             J = j_list[jidx]
             valid_mask = xp.abs(omega_arr) <= J + 0.01
-            valid_indices = xp.where(valid_mask)[0]
-            Nvalid = len(valid_indices)
-            if Nvalid > 0:
-                valid_np = cp.asnumpy(valid_indices)
-                hmat_j = hmat_batch[jidx][xp.ix_(valid_indices, valid_indices)]
-                j_data.append((jidx, J, valid_indices, valid_np, hmat_j, Nvalid))
+            valid_indices_gpu = xp.where(valid_mask)[0]
+            Nvalid = len(valid_indices_gpu)
 
-        # Create CUDA streams for parallel eigendecomposition
-        # Use min of nJ and 8 streams to avoid overhead
-        n_streams = min(len(j_data), 8)
-        streams = [cp.cuda.Stream(non_blocking=True) for _ in range(n_streams)]
-
-        # Launch eigendecomposition on each stream (round-robin assignment)
-        results = [None] * len(j_data)
-        for i, (jidx, J, valid_indices, valid_np, hmat_j, Nvalid) in enumerate(j_data):
-            stream = streams[i % n_streams]
-            with stream:
-                eigenvalues, eigenvectors = xp.linalg.eigh(hmat_j)
-                # Keep on GPU for now
-                results[i] = (jidx, J, valid_np, eigenvalues, eigenvectors)
-
-        # Synchronize all streams before collecting results
-        for stream in streams:
-            stream.synchronize()
-
-        # Collect eigenstates
-        all_eigenstates = []
-        for res in results:
-            if res is None:
+            if Nvalid == 0:
                 continue
-            jidx, J, valid_np, eigenvalues, eigenvectors = res
 
-            # Convert to CPU
-            eigenvalues_np = cp.asnumpy(eigenvalues) / sc
-            eigenvectors_np = cp.asnumpy(eigenvectors)
+            valid_indices = cp.asnumpy(valid_indices_gpu)
 
-            # Create eigenstates
-            for iroot in range(len(eigenvalues_np)):
-                energy = eigenvalues_np[iroot]
-                coeffs = eigenvectors_np[:, iroot]
-                imaxcontr = np.argmax(coeffs ** 2)
+            # Get the valid submatrix for this J (move to CPU for symmetry transformation)
+            hmat_j = cp.asnumpy(hmat_batch[jidx][xp.ix_(valid_indices_gpu, valid_indices_gpu)])
 
-                # Map back to full basis
-                basis_idx = valid_np[imaxcontr]
-                basis_state = active_basis[basis_idx]
+            # Build valid basis list for this J
+            valid_basis = [active_basis[i] for i in valid_indices]
 
-                eigenstate = EigenState(
-                    energy=energy,
-                    J=J,
-                    istate=basis_state.istate,
-                    v=basis_state.v,
-                    lambda_=basis_state.lambda_,
-                    sigma=basis_state.sigma,
-                    omega=basis_state.omega,
-                    spin=basis_state.spin,
-                    parity='+',  # Simplified - would need symmetry handling
-                    name=basis_state.name,
-                    coefficients=coeffs
-                )
-                all_eigenstates.append(eigenstate)
+            # =====================================================
+            # Pair up states and compute parity (itau)
+            # Following Duo's diatom.f90 lines 9612-9698
+            # =====================================================
+            iswap = [0] * Nvalid
+            levels = []
 
-        # Sort by energy
+            for i in range(Nvalid):
+                if iswap[i] != 0:
+                    continue
+
+                state_i = valid_basis[i]
+                ilambda = state_i.lambda_
+                sigmai = state_i.sigma
+                spini = state_i.spin
+                omegai = state_i.omega
+                istate_i = state_i.istate
+                ivib = state_i.ivib
+
+                # Case 1: Lambda=0 and Sigma=0 (single state, no pair)
+                if ilambda == 0 and abs(sigmai) < 0.01:
+                    itau = int(round(spini + J))
+                    if state_i.parity_pm == -1:
+                        itau += 1
+                    itau = abs(itau)
+                    tau = (-1.0) ** itau
+
+                    if itau % 2 == 1:
+                        # Odd itau -> negative parity only
+                        levels.append({
+                            'indices': [i],
+                            'tau': tau,
+                            'nirr': [0, 1]
+                        })
+                    else:
+                        # Even itau -> positive parity only
+                        levels.append({
+                            'indices': [i],
+                            'tau': tau,
+                            'nirr': [1, 0]
+                        })
+                    iswap[i] = i + 1
+                else:
+                    # Case 2: Look for the paired state with opposite lambda, sigma
+                    found_pair = False
+                    for j in range(Nvalid):
+                        if i == j or iswap[j] != 0:
+                            continue
+
+                        state_j = valid_basis[j]
+                        jlambda = state_j.lambda_
+                        sigmaj = state_j.sigma
+                        spinj = state_j.spin
+                        jvib = state_j.ivib
+
+                        # Check if j is the paired state
+                        if (ilambda == -jlambda and
+                            abs(sigmai + sigmaj) < 0.01 and
+                            istate_i == state_j.istate and
+                            ivib == jvib and
+                            abs(spini - spinj) < 0.01):
+
+                            # Compute itau
+                            itau = -ilambda + int(round(spini - sigmai)) + int(round(J - omegai))
+                            if ilambda == 0 and state_i.parity_pm == -1:
+                                itau += 1
+                            tau = (-1.0) ** itau
+
+                            # Order the pair
+                            if ilambda > jlambda or sigmaj < sigmai:
+                                idx_pos = i
+                                idx_neg = j
+                            else:
+                                idx_pos = j
+                                idx_neg = i
+
+                            levels.append({
+                                'indices': [idx_pos, idx_neg],
+                                'tau': tau,
+                                'nirr': [1, 1]
+                            })
+
+                            iswap[i] = (j + 1) * ((-1) ** itau)
+                            iswap[j] = (i + 1) * ((-1) ** itau)
+                            found_pair = True
+                            break
+
+                    # If no pair found, treat as single state
+                    if not found_pair:
+                        itau = int(round(spini + J))
+                        if state_i.parity_pm == -1:
+                            itau += 1
+                        itau = abs(itau)
+                        tau = (-1.0) ** itau
+
+                        if itau % 2 == 1:
+                            levels.append({
+                                'indices': [i],
+                                'tau': tau,
+                                'nirr': [0, 1]
+                            })
+                        else:
+                            levels.append({
+                                'indices': [i],
+                                'tau': tau,
+                                'nirr': [1, 0]
+                            })
+                        iswap[i] = i + 1
+
+            # =====================================================
+            # Build parity blocks and transform
+            # Also build direct quantum number mapping for each symmetrized level
+            # =====================================================
+            pos_levels = []
+            neg_levels = []
+            pos_quanta = []  # Quantum numbers for positive parity levels
+            neg_quanta = []  # Quantum numbers for negative parity levels
+
+            for level in levels:
+                indices = level['indices']
+                nirr = level['nirr']
+                tau = level['tau']
+
+                if len(indices) == 1:
+                    idx = indices[0]
+                    basis_state = valid_basis[idx]
+                    if nirr[0] == 1:
+                        pos_levels.append({'idx': idx, 'single': True})
+                        pos_quanta.append(basis_state)
+                    else:
+                        neg_levels.append({'idx': idx, 'single': True})
+                        neg_quanta.append(basis_state)
+                else:
+                    idx_pos, idx_neg = indices
+                    pos_levels.append({
+                        'idx_pos': idx_pos,
+                        'idx_neg': idx_neg,
+                        'tau': tau,
+                        'single': False
+                    })
+                    pos_quanta.append(valid_basis[idx_pos])
+                    neg_levels.append({
+                        'idx_pos': idx_pos,
+                        'idx_neg': idx_neg,
+                        'tau': tau,
+                        'single': False
+                    })
+                    neg_quanta.append(valid_basis[idx_neg])
+
+            # =====================================================
+            # Diagonalize each parity block
+            # =====================================================
+            for irrep, (block_levels, block_quanta, parity_char) in enumerate([
+                (pos_levels, pos_quanta, '+'),
+                (neg_levels, neg_quanta, '-')
+            ]):
+                if len(block_levels) == 0:
+                    continue
+
+                Nblock = len(block_levels)
+                hsym = np.zeros((Nblock, Nblock), dtype=np.float64)
+
+                for ilevel, level_i in enumerate(block_levels):
+                    for jlevel, level_j in enumerate(block_levels):
+                        if level_i['single'] and level_j['single']:
+                            i = level_i['idx']
+                            j = level_j['idx']
+                            hsym[ilevel, jlevel] = hmat_j[i, j]
+
+                        elif level_i['single'] and not level_j['single']:
+                            i = level_i['idx']
+                            jp, jn = level_j['idx_pos'], level_j['idx_neg']
+                            tauj = level_j['tau']
+                            if irrep == 0:
+                                hsym[ilevel, jlevel] = (hmat_j[i, jp] + tauj * hmat_j[i, jn]) / np.sqrt(2)
+                            else:
+                                hsym[ilevel, jlevel] = (hmat_j[i, jp] - tauj * hmat_j[i, jn]) / np.sqrt(2)
+
+                        elif not level_i['single'] and level_j['single']:
+                            ip, in_ = level_i['idx_pos'], level_i['idx_neg']
+                            taui = level_i['tau']
+                            j = level_j['idx']
+                            if irrep == 0:
+                                hsym[ilevel, jlevel] = (hmat_j[ip, j] + taui * hmat_j[in_, j]) / np.sqrt(2)
+                            else:
+                                hsym[ilevel, jlevel] = (hmat_j[ip, j] - taui * hmat_j[in_, j]) / np.sqrt(2)
+
+                        else:
+                            ip, in_ = level_i['idx_pos'], level_i['idx_neg']
+                            jp, jn = level_j['idx_pos'], level_j['idx_neg']
+                            taui = level_i['tau']
+                            tauj = level_j['tau']
+
+                            if irrep == 0:
+                                hsym[ilevel, jlevel] = 0.5 * (
+                                    hmat_j[ip, jp] + taui * hmat_j[in_, jp] +
+                                    tauj * hmat_j[ip, jn] + taui * tauj * hmat_j[in_, jn]
+                                )
+                            else:
+                                hsym[ilevel, jlevel] = 0.5 * (
+                                    hmat_j[ip, jp] - taui * hmat_j[in_, jp] -
+                                    tauj * hmat_j[ip, jn] + taui * tauj * hmat_j[in_, jn]
+                                )
+
+                # Symmetrize
+                hsym = (hsym + hsym.T) / 2.0
+
+                # Diagonalize on GPU
+                hsym_gpu = cp.asarray(hsym)
+                eigenvalues, eigenvectors = cp.linalg.eigh(hsym_gpu)
+                eigenvalues_np = cp.asnumpy(eigenvalues) / sc
+                eigenvectors_np = cp.asnumpy(eigenvectors)
+
+                # Create eigenstates using expectation value matching
+                # Use precomputed block_quanta for quantum number lookup
+                used_imaxcontr = set()
+
+                # Precompute quantum number arrays for this block
+                block_omegas = np.array([q.omega for q in block_quanta])
+                block_sigmas = np.array([q.sigma for q in block_quanta])
+                block_vs = np.array([q.v for q in block_quanta])
+                block_istates = np.array([q.istate for q in block_quanta])
+
+                for iroot in range(len(eigenvalues_np)):
+                    energy = eigenvalues_np[iroot]
+                    coeffs = eigenvectors_np[:, iroot]
+                    coeffs_sq = coeffs ** 2
+
+                    # Compute expectation values of quantum numbers
+                    omega_exp = np.sum(coeffs_sq * block_omegas)
+                    sigma_exp = np.sum(coeffs_sq * block_sigmas)
+                    v_exp = np.sum(coeffs_sq * block_vs)
+                    istate_exp = np.sum(coeffs_sq * block_istates)
+
+                    # Find unused level closest to expectation values
+                    best_idx = None
+                    best_dist = float('inf')
+
+                    for idx in range(len(block_quanta)):
+                        if idx in used_imaxcontr:
+                            continue
+
+                        q = block_quanta[idx]
+                        dist = (10.0 * abs(q.istate - istate_exp) +
+                                5.0 * abs(q.v - v_exp) +
+                                1.0 * abs(q.omega - omega_exp) +
+                                0.5 * abs(q.sigma - sigma_exp))
+
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_idx = idx
+
+                    if best_idx is None:
+                        best_idx = np.argmax(coeffs_sq)
+
+                    used_imaxcontr.add(best_idx)
+                    basis_state = block_quanta[best_idx]
+
+                    eigenstate = EigenState(
+                        energy=energy,
+                        J=J,
+                        istate=basis_state.istate,
+                        v=basis_state.v,
+                        lambda_=basis_state.lambda_,
+                        sigma=basis_state.sigma,
+                        omega=basis_state.omega,
+                        spin=basis_state.spin,
+                        parity=parity_char,
+                        name=basis_state.name,
+                        coefficients=coeffs
+                    )
+                    all_eigenstates.append(eigenstate)
+
+        # Sort by (J, energy)
         all_eigenstates.sort(key=lambda x: (x.J, x.energy))
 
         return all_eigenstates
@@ -1265,6 +1661,46 @@ class HamiltonianBuilder:
             ss_wf = ss_values.reshape(-1, 1) * self._wf_gpu
             ss_matelem = xp.dot(self._wf_gpu.T, ss_wf)
             self._ss_matelem_cache.append(ss_matelem)
+
+        # Pre-compute spin-rotation field matrix elements
+        self._sr_matelem_cache = []
+        for sr_field in self.spinrot:
+            if sr_field.parameters is None or len(sr_field.parameters) == 0:
+                self._sr_matelem_cache.append(None)
+                continue
+            sr_values = sr_field.evaluate(self._r_gpu, use_gpu=self.use_gpu)
+            if isinstance(sr_values, np.ndarray):
+                sr_values = xp.asarray(sr_values)
+            sr_wf = sr_values.reshape(-1, 1) * self._wf_gpu
+            sr_matelem = xp.dot(self._wf_gpu.T, sr_wf)
+            self._sr_matelem_cache.append(sr_matelem)
+
+        # Pre-compute BOB-rot field matrix elements (scaled by b_rot/r^2*sc)
+        self._bobrot_matelem_cache = []
+        for bobrot_field in self.bobrot:
+            if bobrot_field.parameters is None or len(bobrot_field.parameters) == 0:
+                self._bobrot_matelem_cache.append(None)
+                continue
+            bob_values = bobrot_field.evaluate(self._r_gpu, use_gpu=self.use_gpu)
+            if isinstance(bob_values, np.ndarray):
+                bob_values = xp.asarray(bob_values)
+            bob_scaled = bob_values * self._b_rot_r2_gpu * self._sc
+            bob_wf = bob_scaled.reshape(-1, 1) * self._wf_gpu
+            bob_matelem = xp.dot(self._wf_gpu.T, bob_wf)
+            self._bobrot_matelem_cache.append(bob_matelem)
+
+        # Pre-compute BOB-vib field matrix elements (no scaling)
+        self._bobvib_matelem_cache = []
+        for bv_field in self.bobvib:
+            if bv_field.parameters is None or len(bv_field.parameters) == 0:
+                self._bobvib_matelem_cache.append(None)
+                continue
+            bv_values = bv_field.evaluate(self._r_gpu, use_gpu=self.use_gpu)
+            if isinstance(bv_values, np.ndarray):
+                bv_values = xp.asarray(bv_values)
+            bv_wf = bv_values.reshape(-1, 1) * self._wf_gpu
+            bv_matelem = xp.dot(self._wf_gpu.T, bv_wf)
+            self._bobvib_matelem_cache.append(bv_matelem)
 
     def build_rovibronic_hamiltonian(self, J: float) -> np.ndarray:
         """
@@ -1342,22 +1778,30 @@ class HamiltonianBuilder:
 
         # =====================================================
         # S-UNCOUPLING (fully vectorized on GPU)
-        # Selection rules: Delta Lambda = 0, |Delta Sigma| = 1
+        # Selection rules: Delta Lambda = 0, |Delta Sigma| = 1, same electronic state, same spin
+        # (Duo line 11543: istate==jstate, ilambda==jlambda, |sigmai-sigmaj|==1, spini==spinj)
         # =====================================================
-        s_uncoupling_mask = (xp.abs(dlambda) < 0.5) & (xp.abs(xp.abs(dsigma) - 1.0) < 0.5)
+        istate_i = istate_arr[i_grid]
+        istate_j = istate_arr[j_grid]
+        spin_i = spin_arr[i_grid]
+        spin_j = spin_arr[j_grid]
+        same_state = (istate_i == istate_j)  # Must be same electronic state
+        same_spin = (xp.abs(spin_i - spin_j) < 0.5)  # Same spin
+        s_uncoupling_mask = same_state & same_spin & (xp.abs(dlambda) < 0.5) & (xp.abs(xp.abs(dsigma) - 1.0) < 0.5)
 
         if xp.any(s_uncoupling_mask):
             # Get B(r) matrix elements using pre-computed ivib grids
             brot_full = brot_matelem_gpu[ivib_i_grid, ivib_j_grid]
 
-            # f_s = sign of sigma change
-            f_s = xp.sign(dsigma)
+            # Duo line 11547: f_s = sigmaj - sigmai (note: j - i, not i - j)
+            # dsigma = sigma_i - sigma_j, so f_s = -dsigma
+            f_s = -dsigma
 
             # S+/S- and J+/J- matrix elements (all on GPU)
             sigma_i = sigma_arr[i_grid]
-            spin_i = spin_arr[i_grid]
             omega_i = omega_arr[i_grid]
 
+            # Duo line 11552: sqrt(spini*(spini+1) - sigmai*(sigmai + f_s))
             s_factor = xp.sqrt(xp.maximum(0, spin_i * (spin_i + 1) - sigma_i * (sigma_i + f_s)))
             j_factor = xp.sqrt(xp.maximum(0, J * (J + 1) - omega_i * (omega_i + f_s)))
 
@@ -2245,46 +2689,97 @@ class HamiltonianBuilder:
 
         # =====================================================
         # STEP 2: Build symmetry transformation and blocks
+        # Following Duo's exact structure with irec and ilevel2i mappings
         # =====================================================
-        # Collect indices for each parity block
-        pos_indices = []  # Indices for positive parity block
-        neg_indices = []  # Indices for negative parity block
-        pos_levels = []   # Level info for positive parity
-        neg_levels = []   # Level info for negative parity
+        # Build Duo's mapping arrays:
+        # - irec[irrep][isym] = ilevel (level index for symmetry position isym)
+        # - ilevel2i[ilevel][irrep] = contracted basis index
+        # - Nsym[irrep] = count of levels in each symmetry block
 
-        for level in levels:
+        Nlevels = len(levels)
+        Nsym = [0, 0]  # [positive, negative] counts
+        ilevel2i = [[0, 0] for _ in range(Nlevels)]  # ilevel -> [pos_idx, neg_idx]
+        ilevel2isym = [[0, 0] for _ in range(Nlevels)]  # ilevel -> [pos_sym, neg_sym]
+
+        # Process levels to build ilevel2i and count Nsym
+        for ilevel, level in enumerate(levels):
+            indices = level['indices']
+            nirr = level['nirr']
+
+            if len(indices) == 1:
+                # Single state - only exists in one parity
+                idx = indices[0]
+                if nirr[0] == 1:  # Positive parity
+                    Nsym[0] += 1
+                    ilevel2isym[ilevel][0] = Nsym[0]
+                    ilevel2i[ilevel][0] = idx
+                else:  # Negative parity
+                    Nsym[1] += 1
+                    ilevel2isym[ilevel][1] = Nsym[1]
+                    ilevel2i[ilevel][1] = idx
+            else:
+                # Paired states - exist in both parities
+                idx_pos, idx_neg = indices
+                Nsym[0] += 1
+                Nsym[1] += 1
+                ilevel2isym[ilevel][0] = Nsym[0]
+                ilevel2isym[ilevel][1] = Nsym[1]
+                ilevel2i[ilevel][0] = idx_pos
+                ilevel2i[ilevel][1] = idx_neg
+
+        # Build irec arrays: irec[irrep] maps isym -> ilevel
+        # And build block_icontr: direct mapping from isym -> contracted basis index
+        irec = [[], []]  # irec[0] = positive parity, irec[1] = negative parity
+        block_icontr = [[], []]  # Direct: block_icontr[irrep][isym] = contracted basis index
+
+        # Also build block_levels for constructing the Hamiltonian
+        pos_indices = []
+        neg_indices = []
+        pos_levels = []
+        neg_levels = []
+
+        for ilevel, level in enumerate(levels):
             indices = level['indices']
             nirr = level['nirr']
             tau = level['tau']
 
             if len(indices) == 1:
-                # Single state (Sigma with sigma=0)
+                # Single state - only exists in one parity
+                idx = indices[0]
                 if nirr[0] == 1:  # Positive parity
-                    pos_indices.append(indices[0])
-                    pos_levels.append({'idx': indices[0], 'single': True})
+                    irec[0].append(ilevel)
+                    block_icontr[0].append(idx)
+                    pos_indices.append(idx)
+                    pos_levels.append({'idx': idx, 'single': True, 'ilevel': ilevel})
                 else:  # Negative parity
-                    neg_indices.append(indices[0])
-                    neg_levels.append({'idx': indices[0], 'single': True})
+                    irec[1].append(ilevel)
+                    block_icontr[1].append(idx)
+                    neg_indices.append(idx)
+                    neg_levels.append({'idx': idx, 'single': True, 'ilevel': ilevel})
             else:
-                # Paired states - both go to both blocks via linear combinations
+                # Paired states - exist in both parities
                 idx_pos, idx_neg = indices
-
-                # For positive parity block: (|+> + tau|->)/sqrt(2)
-                pos_indices.append(idx_pos)  # Primary state for + block
+                # Positive parity: use ilevel2i[ilevel][0] = idx_pos
+                irec[0].append(ilevel)
+                block_icontr[0].append(idx_pos)
+                pos_indices.append(idx_pos)
                 pos_levels.append({
                     'idx_pos': idx_pos,
                     'idx_neg': idx_neg,
                     'tau': tau,
-                    'single': False
+                    'single': False,
+                    'ilevel': ilevel
                 })
-
-                # For negative parity block: (|+> - tau|->)/sqrt(2)
-                neg_indices.append(idx_neg)  # Primary state for - block
+                # Negative parity: use ilevel2i[ilevel][1] = idx_neg
+                irec[1].append(ilevel)
+                block_icontr[1].append(idx_neg)
+                neg_indices.append(idx_neg)
                 neg_levels.append({
                     'idx_pos': idx_pos,
                     'idx_neg': idx_neg,
                     'tau': tau,
-                    'single': False
+                    'single': False,
+                    'ilevel': ilevel
                 })
 
         # =====================================================
@@ -2304,8 +2799,8 @@ class HamiltonianBuilder:
             # Build the transformed Hamiltonian for this parity block
             hsym = np.zeros((Nblock, Nblock), dtype=np.float64)
 
-            for ilevel, level_i in enumerate(block_levels):
-                for jlevel, level_j in enumerate(block_levels):
+            for isym, level_i in enumerate(block_levels):
+                for jsym, level_j in enumerate(block_levels):
                     # Compute <sym_i|H|sym_j>
                     # For single states: just use the original element
                     # For paired states: use the symmetrized transformation
@@ -2314,7 +2809,7 @@ class HamiltonianBuilder:
                         # Both single states
                         i = level_i['idx']
                         j = level_j['idx']
-                        hsym[ilevel, jlevel] = hmat[i, j]
+                        hsym[isym, jsym] = hmat[i, j]
 
                     elif level_i['single'] and not level_j['single']:
                         # i single, j paired
@@ -2322,9 +2817,9 @@ class HamiltonianBuilder:
                         jp, jn = level_j['idx_pos'], level_j['idx_neg']
                         tauj = level_j['tau']
                         if irrep == 0:  # Positive parity
-                            hsym[ilevel, jlevel] = (hmat[i, jp] + tauj * hmat[i, jn]) / np.sqrt(2)
+                            hsym[isym, jsym] = (hmat[i, jp] + tauj * hmat[i, jn]) / np.sqrt(2)
                         else:  # Negative parity
-                            hsym[ilevel, jlevel] = (hmat[i, jp] - tauj * hmat[i, jn]) / np.sqrt(2)
+                            hsym[isym, jsym] = (hmat[i, jp] - tauj * hmat[i, jn]) / np.sqrt(2)
 
                     elif not level_i['single'] and level_j['single']:
                         # i paired, j single
@@ -2332,9 +2827,9 @@ class HamiltonianBuilder:
                         taui = level_i['tau']
                         j = level_j['idx']
                         if irrep == 0:  # Positive parity
-                            hsym[ilevel, jlevel] = (hmat[ip, j] + taui * hmat[in_, j]) / np.sqrt(2)
+                            hsym[isym, jsym] = (hmat[ip, j] + taui * hmat[in_, j]) / np.sqrt(2)
                         else:  # Negative parity
-                            hsym[ilevel, jlevel] = (hmat[ip, j] - taui * hmat[in_, j]) / np.sqrt(2)
+                            hsym[isym, jsym] = (hmat[ip, j] - taui * hmat[in_, j]) / np.sqrt(2)
 
                     else:
                         # Both paired
@@ -2344,12 +2839,12 @@ class HamiltonianBuilder:
                         tauj = level_j['tau']
 
                         if irrep == 0:  # Positive parity: (|+> + tau|->)/sqrt(2)
-                            hsym[ilevel, jlevel] = 0.5 * (
+                            hsym[isym, jsym] = 0.5 * (
                                 hmat[ip, jp] + taui * hmat[in_, jp] +
                                 tauj * hmat[ip, jn] + taui * tauj * hmat[in_, jn]
                             )
                         else:  # Negative parity: (|+> - tau|->)/sqrt(2)
-                            hsym[ilevel, jlevel] = 0.5 * (
+                            hsym[isym, jsym] = 0.5 * (
                                 hmat[ip, jp] - taui * hmat[in_, jp] -
                                 tauj * hmat[ip, jn] + taui * tauj * hmat[in_, jn]
                             )
@@ -2370,8 +2865,12 @@ class HamiltonianBuilder:
             eigenvalues = eigenvalues / sc
 
             # =====================================================
-            # STEP 4: Assign quantum numbers from largest contributor
+            # STEP 4: Assign quantum numbers using EXACTLY Duo's approach
+            # imaxcontr = argmax of coefficient^2 (index in symmetry block)
+            # block_icontr[irrep][imaxcontr] = contracted basis index directly
             # =====================================================
+            QNs = [None] * len(eigenvalues)  # Store imaxcontr for each root
+
             for iroot in range(len(eigenvalues)):
                 energy = eigenvalues[iroot]
 
@@ -2380,22 +2879,57 @@ class HamiltonianBuilder:
                     if energy < energy_range[0] or energy > energy_range[1]:
                         continue
 
-                # Find the level with largest contribution
                 coeffs = eigenvectors[:, iroot]
-                imaxcontr = np.argmax(coeffs ** 2)
+                coeffs_sq = coeffs ** 2
 
-                # Get the basis state for this level
-                level = block_levels[imaxcontr]
-                if level['single']:
-                    idx = level['idx']
+                # Find largest coefficient (Duo: maxloc)
+                # When coefficients are nearly equal (within tolerance), prefer the
+                # LOWEST index to match Fortran's maxloc behavior which returns
+                # the first occurrence of the maximum.
+                tol = 1e-6  # Relative tolerance for considering coefficients equal
+                max_val = np.max(coeffs_sq)
+                if max_val > 0:
+                    # Find all indices within tolerance of the maximum
+                    near_max_mask = coeffs_sq >= max_val * (1.0 - tol)
+                    near_max_indices = np.where(near_max_mask)[0]
+                    # Take the lowest index among those near the maximum
+                    imaxcontr = int(near_max_indices[0])
                 else:
-                    # For paired states, use the primary index for this parity
-                    if irrep == 0:  # Positive parity -> use idx_pos
-                        idx = level['idx_pos']
-                    else:  # Negative parity -> use idx_neg
-                        idx = level['idx_neg']
+                    imaxcontr = int(np.argmax(coeffs_sq))
+                maxcontr = coeffs_sq[imaxcontr]
 
-                basis_state = active_basis[idx]
+                # Check if already used, take second largest if so (Duo's loop_check)
+                small_ = 1e-12
+                i0 = 0
+                while True:
+                    found_duplicate = False
+                    for ilevel_prev in range(iroot):
+                        if QNs[ilevel_prev] is not None and imaxcontr == QNs[ilevel_prev]:
+                            # Find next largest that's smaller than current max
+                            mask2 = (coeffs_sq >= small_) & (coeffs_sq < maxcontr)
+                            if np.any(mask2):
+                                masked_coeffs2 = np.where(mask2, coeffs_sq, -np.inf)
+                                max_val2 = np.max(masked_coeffs2)
+                                # Apply same tolerance-based tie-breaking
+                                near_max_mask2 = masked_coeffs2 >= max_val2 * (1.0 - tol)
+                                near_max_indices2 = np.where(near_max_mask2)[0]
+                                imaxcontr = int(near_max_indices2[0])
+                                maxcontr = coeffs_sq[imaxcontr]
+                            i0 += 1
+                            if i0 > 10:
+                                # Fallback to largest
+                                imaxcontr = int(np.argmax(coeffs_sq))
+                                break
+                            found_duplicate = True
+                            break
+                    if not found_duplicate or i0 > 10:
+                        break
+
+                QNs[iroot] = imaxcontr
+
+                # Direct mapping: block_icontr[irrep][imaxcontr] gives contracted basis index
+                mterm = block_icontr[irrep][imaxcontr]
+                basis_state = active_basis[mterm]
 
                 eigenstate = EigenState(
                     energy=energy,
