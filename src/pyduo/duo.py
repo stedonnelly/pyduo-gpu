@@ -316,7 +316,14 @@ class DuoSolver:
             for i, _ in enumerate(self.states):
                 max_vib[i] = min(self.grid.npoints // 10, 50)
 
-        self.hamiltonian.solve_vibrational_problem(max_vib_states=max_vib)
+        # Determine max vibrational energy per electronic state (if specified)
+        max_energy = {}
+        if self.parser and self.parser.job.vibenermax:
+            # vibenermax in parser uses 1-based state indexing, convert to 0-based
+            for state_id, emax in self.parser.job.vibenermax.items():
+                max_energy[state_id - 1] = emax
+
+        self.hamiltonian.solve_vibrational_problem(max_vib_states=max_vib, max_energy=max_energy if max_energy else None)
 
         # Store results
         for istate in range(len(self.states)):
@@ -330,6 +337,18 @@ class DuoSolver:
         if self.verbose >= 3:
             print(f"  Vibrational problem solved in {vib_time:.2f} s")
             print(f"  Total contracted basis states: {len(self.hamiltonian.contracted_basis)}")
+            # Show vmax used per state
+            vib_counts = {}
+            for bs in self.hamiltonian.contracted_basis:
+                key = (bs.istate, bs.name)
+                if key not in vib_counts:
+                    vib_counts[key] = 0
+                # Count unique v values per (istate, lambda, sigma) combo
+                # We just need max v per state
+                vib_counts[key] = max(vib_counts[key], bs.v + 1)
+            print("  Vibrational states per electronic state:")
+            for (istate, name), nvib in sorted(vib_counts.items()):
+                print(f"    State {istate} ({name}): {nvib} vib states")
 
         if self.verbose >= 4:
             print("\n  Vibrational energies (cm^-1):")

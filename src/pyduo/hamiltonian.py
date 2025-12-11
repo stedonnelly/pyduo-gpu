@@ -570,7 +570,8 @@ class HamiltonianBuilder:
             so_matelem = xp.dot(self._wf_gpu.T, so_wf)
             self._so_matelem_cache.append(so_matelem)
 
-        # Pre-compute L+ field evaluations (scaled by B(r)/r^2)
+        # Pre-compute L+ (LxLy) field evaluations
+        # NOTE: LxLy matrix elements are NOT scaled by B(r)/r^2 - they're just <psi|Lx|psi'>
         self._lx_matelem_cache = []
         for lxly_field in self.lxly:
             if lxly_field.parameters is None or len(lxly_field.parameters) == 0:
@@ -579,8 +580,9 @@ class HamiltonianBuilder:
             lx_values = lxly_field.evaluate(self._r_gpu, use_gpu=self.use_gpu)
             if self.use_gpu and isinstance(lx_values, np.ndarray):
                 lx_values = cp.asarray(lx_values)
-            lx_scaled = lx_values * self._b_rot_r2_gpu * self._sc
-            lx_wf = lx_scaled.reshape(-1, 1) * self._wf_gpu
+            # NOTE: LxLy matrix elements are NOT scaled by B(r)/r^2
+            # They are just integrated directly (unlike rotational terms)
+            lx_wf = lx_values.reshape(-1, 1) * self._wf_gpu
             lx_matelem = xp.dot(self._wf_gpu.T, lx_wf)
             self._lx_matelem_cache.append(lx_matelem)
 
@@ -1560,11 +1562,20 @@ class HamiltonianBuilder:
                 eigenvectors_np = eigenvectors
 
                 # =====================================================
-                # Assign quantum numbers - EXACTLY matching Duo
+                # Assign quantum numbers - matching Duo with enhanced
+                # tie-breaking for nearly-degenerate states
                 # Duo diatom.f90 lines 10015-10092
                 # =====================================================
                 QNs = [None] * len(eigenvalues_np)
                 small_ = 1e-12
+
+                # Build array of Omega values for each symmetrized basis function
+                # This is used for expectation-value based tie-breaking
+                omega_sym = np.zeros(Nblock)
+                for isym in range(Nblock):
+                    mlevel = irec[isym]
+                    mterm = ilevel2i[mlevel][irrep]
+                    omega_sym[isym] = valid_basis[mterm].omega
 
                 for iroot in range(len(eigenvalues_np)):
                     energy = eigenvalues_np[iroot]
@@ -1602,6 +1613,27 @@ class HamiltonianBuilder:
                                 break
                         if not found_duplicate or i0 > 10:
                             break
+
+                    # Enhanced tie-breaking: if there are multiple coefficients
+                    # within 10% of the maximum, use <Omega> expectation value
+                    # to select the most appropriate basis state
+                    threshold = 0.9 * maxcontr
+                    candidates = np.where((coeffs_sq >= threshold) & valid_mask)[0]
+                    if len(candidates) > 1:
+                        # Compute <Omega> expectation value for this eigenstate
+                        omega_expect = np.sum(coeffs_sq * omega_sym)
+
+                        # Find candidate closest to <Omega> that hasn't been used
+                        best_candidate = imaxcontr
+                        best_dist = abs(omega_sym[imaxcontr] - omega_expect)
+                        for cand in candidates:
+                            if cand in QNs[:iroot]:
+                                continue  # Already used
+                            dist = abs(omega_sym[cand] - omega_expect)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_candidate = cand
+                        imaxcontr = best_candidate
 
                     QNs[iroot] = imaxcontr
 
@@ -1679,6 +1711,8 @@ class HamiltonianBuilder:
             so_matelem = xp.dot(self._wf_gpu.T, so_wf)
             self._so_matelem_cache.append(so_matelem)
 
+        # Pre-compute L+ (LxLy) field matrix elements
+        # NOTE: LxLy matrix elements are NOT scaled by B(r)/r^2 - they're just <psi|Lx|psi'>
         self._lx_matelem_cache = []
         for lxly_field in self.lxly:
             if lxly_field.parameters is None or len(lxly_field.parameters) == 0:
@@ -1687,8 +1721,8 @@ class HamiltonianBuilder:
             lx_values = lxly_field.evaluate(self._r_gpu, use_gpu=self.use_gpu)
             if isinstance(lx_values, np.ndarray):
                 lx_values = xp.asarray(lx_values)
-            lx_scaled = lx_values * self._b_rot_r2_gpu * self._sc
-            lx_wf = lx_scaled.reshape(-1, 1) * self._wf_gpu
+            # LxLy is NOT scaled by B(r)/r^2 (unlike rotational terms)
+            lx_wf = lx_values.reshape(-1, 1) * self._wf_gpu
             lx_matelem = xp.dot(self._wf_gpu.T, lx_wf)
             self._lx_matelem_cache.append(lx_matelem)
 
@@ -2036,7 +2070,7 @@ class HamiltonianBuilder:
             lambda_i_lx = lxly_field.lambda_i
             lambda_j_lx = lxly_field.lambda_j
 
-            # Use pre-computed matrix elements from cache (already scaled by b_rot/r^2*sc)
+            # Use pre-computed matrix elements from cache (NOT scaled by B(r)/r^2)
             lx_matelem = self._lx_matelem_cache[lx_idx]
             if lx_matelem is None:
                 continue
@@ -2074,7 +2108,6 @@ class HamiltonianBuilder:
 
                     if abs(sigmaj_expected - sigmaj) < 0.5:
                         # S+/S- matrix element
-                        # Matrix elements already include b_rot/r^2*sc (from line 621)
                         s_factor = np.sqrt(max(0, spini * (spini + 1) - sigmai * (sigmai + f_s)))
                         f_t = f_grid * s_factor
                         hmat[i, j] += f_t
@@ -2086,7 +2119,6 @@ class HamiltonianBuilder:
                     if abs(sigmai - sigmaj) < 0.5:
                         f_l = float(jlambda - ilambda)  # Direction of L+/L-
                         # J+/J- matrix element (note the minus sign)
-                        # Matrix elements already include b_rot/r^2*sc (from line 621)
                         j_factor = np.sqrt(max(0, J * (J + 1) - omegai * (omegai + f_l)))
                         f_t = -f_grid * j_factor
                         hmat[i, j] += f_t
@@ -2907,11 +2939,20 @@ class HamiltonianBuilder:
             eigenvalues = eigenvalues / sc
 
             # =====================================================
-            # STEP 4: Assign quantum numbers using EXACTLY Duo's approach
+            # STEP 4: Assign quantum numbers using Duo's approach with
+            # enhanced tie-breaking for nearly-degenerate states
             # imaxcontr = argmax of coefficient^2 (index in symmetry block)
             # block_icontr[irrep][imaxcontr] = contracted basis index directly
             # =====================================================
             QNs = [None] * len(eigenvalues)  # Store imaxcontr for each root
+
+            # Build array of Omega values for each symmetrized basis function
+            # This is used for expectation-value based tie-breaking
+            Nblock = len(block_levels)
+            omega_sym = np.zeros(Nblock)
+            for isym in range(Nblock):
+                mterm = block_icontr[irrep][isym]
+                omega_sym[isym] = active_basis[mterm].omega
 
             for iroot in range(len(eigenvalues)):
                 energy = eigenvalues[iroot]
@@ -2966,6 +3007,27 @@ class HamiltonianBuilder:
                             break
                     if not found_duplicate or i0 > 10:
                         break
+
+                # Enhanced tie-breaking: if there are multiple coefficients
+                # within 10% of the maximum, use <Omega> expectation value
+                # to select the most appropriate basis state
+                threshold = 0.9 * maxcontr
+                candidates = np.where(coeffs_sq >= threshold)[0]
+                if len(candidates) > 1:
+                    # Compute <Omega> expectation value for this eigenstate
+                    omega_expect = np.sum(coeffs_sq * omega_sym)
+
+                    # Find candidate closest to <Omega> that hasn't been used
+                    best_candidate = imaxcontr
+                    best_dist = abs(omega_sym[imaxcontr] - omega_expect)
+                    for cand in candidates:
+                        if cand in QNs[:iroot]:
+                            continue  # Already used
+                        dist = abs(omega_sym[cand] - omega_expect)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_candidate = cand
+                    imaxcontr = best_candidate
 
                 QNs[iroot] = imaxcontr
 

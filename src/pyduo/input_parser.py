@@ -133,6 +133,7 @@ class InputParser:
         self._parse_couplings(content)
         self._parse_contraction(content)
         self._link_morphing_fields()  # Link fields to ab initio data
+        self._set_field_parities()  # Set parity_i/parity_j on coupling fields
 
     def _parse_atoms(self, content: str):
         """Parse atom definitions."""
@@ -266,11 +267,17 @@ class InputParser:
         lambda_ = 0
         multiplicity = 1
         symmetry = ""
+        parity_pm = 0  # +1 for +, -1 for -, 0 for unspecified
 
         # Look for name
         match = re.search(r'(?i)name\s+"?([^"\n]+)"?', content)
         if match:
             name = match.group(1).strip()
+
+        # Look for symmetry (+/-)
+        match = re.search(r'(?i)symmetry\s+([+-])', content)
+        if match:
+            parity_pm = 1 if match.group(1) == '+' else -1
 
         # Look for lambda (from state name like Sigma, Pi, Delta)
         if 'Sigma' in name or 'SIGMA' in name:
@@ -342,7 +349,8 @@ class InputParser:
             istate=istate,
             lambda_=lambda_,
             multiplicity=multiplicity,
-            spin=spin
+            spin=spin,
+            parity_pm=parity_pm
         )
         self.states.append(state)
 
@@ -413,10 +421,11 @@ class InputParser:
 
         # Parse factor (1, i, -i, sqrt(2), etc.)
         factor = 1.0
+        complex_f = complex(1.0, 0.0)
         factor_match = re.search(r'(?i)factor\s+([\S]+)', content)
         if factor_match:
             factor_str = factor_match.group(1).lower()
-            factor = self._parse_factor(factor_str)
+            factor, complex_f = self._parse_factor(factor_str)
 
         # Parse <x|Lz|y> for MOLPRO representation
         # Format: <x|Lz|y>  ix_lz_y  jx_lz_y
@@ -465,29 +474,55 @@ class InputParser:
         )
         so.morphing = morphing
         so.factor = factor
+        so.complex_f = complex_f
         so.ix_lz_y = ix_lz_y
         so.jx_lz_y = jx_lz_y
         self.spinorbit.append(so)
 
-    def _parse_factor(self, factor_str: str) -> float:
+    def _parse_factor(self, factor_str: str) -> tuple:
         """
-        Parse factor string to float value.
+        Parse factor string to (real_factor, complex_f) tuple.
+
+        Returns:
+            tuple: (factor: float, complex_f: complex)
+                - factor: real scaling factor applied to gridvalue
+                - complex_f: complex factor for molpro_duo transformation
 
         Supported formats:
-        - 1, -1, 0
-        - i, -i (treated as 1 for magnitude)
-        - sqrt(2), -sqrt(2)
-        - i*sqrt(2)
+        - 1, -1, 0 -> (value, value+0j)
+        - i, -i -> (1.0, 0+1j or 0-1j)
+        - sqrt(2), -sqrt(2) -> (sqrt(2), sqrt(2)+0j)
+        - i*sqrt(2), -i*sqrt(2) -> (1.0, 0+sqrt(2)j or 0-sqrt(2)j)
+
+        Duo stores these separately:
+        - field%factor: real scaling multiplied into gridvalue
+        - field%complex_f: complex factor used in molpro_duo transformation
         """
         factor_str = factor_str.strip().lower()
 
-        # Remove imaginary unit (we use magnitude only for now)
-        if factor_str.startswith('i*') or factor_str.startswith('-i*'):
-            factor_str = factor_str.replace('i*', '')
-        elif factor_str == 'i':
-            return 1.0
+        # Handle pure imaginary cases
+        if factor_str == 'i':
+            return (1.0, complex(0, 1))
         elif factor_str == '-i':
-            return -1.0
+            return (1.0, complex(0, -1))
+
+        # Handle i*something or -i*something
+        if factor_str.startswith('i*'):
+            rest = factor_str[2:]
+            real_val = self._parse_real_factor(rest)
+            return (1.0, complex(0, real_val))
+        elif factor_str.startswith('-i*'):
+            rest = factor_str[3:]
+            real_val = self._parse_real_factor(rest)
+            return (1.0, complex(0, -real_val))
+
+        # Pure real factor
+        real_val = self._parse_real_factor(factor_str)
+        return (real_val, complex(real_val, 0))
+
+    def _parse_real_factor(self, factor_str: str) -> float:
+        """Parse a real-valued factor string."""
+        factor_str = factor_str.strip().lower()
 
         # Handle sqrt expressions
         sqrt_match = re.search(r'(-?)sqrt\(([\d.]+)\)', factor_str)
@@ -624,10 +659,11 @@ class InputParser:
 
         # Parse factor
         factor = 1.0
+        complex_f = complex(1.0, 0.0)
         factor_match = re.search(r'(?i)factor\s+([\S]+)', content)
         if factor_match:
             factor_str = factor_match.group(1).lower()
-            factor = self._parse_factor(factor_str)
+            factor, complex_f = self._parse_factor(factor_str)
 
         # Parse <x|Lz|y> for MOLPRO representation
         ix_lz_y = 0
@@ -660,6 +696,7 @@ class InputParser:
         )
         coupling.morphing = morphing
         coupling.factor = factor
+        coupling.complex_f = complex_f
         coupling.ix_lz_y = ix_lz_y
         coupling.jx_lz_y = jx_lz_y
         self.couplings.append(coupling)
@@ -690,20 +727,32 @@ class InputParser:
                 self.job.vibmax[i + 1] = int(v)
 
         # Parse VMAX (can be single value or multiple values like "vmax 80 50 50 50 50")
+        # Duo behavior: each value fills forward to all subsequent states
+        # So "vmax 80 50" with 5 states -> [80, 50, 50, 50, 50]
         vmax_pattern = r'(?i)vmax\s+([\d\s]+)'
         match = re.search(vmax_pattern, contraction_content)
         if match:
             values = self._extract_numbers(match.group(1))
-            if len(values) == 1:
-                # Single value - apply to all states
-                vmax = int(values[0])
-                for i in range(len(self.states)):
-                    if (i + 1) not in self.job.vibmax:
-                        self.job.vibmax[i + 1] = vmax
-            else:
-                # Multiple values - one per state
-                for i, v in enumerate(values):
-                    self.job.vibmax[i + 1] = int(v)
+            nstates = len(self.states)
+            last_vmax = int(values[0]) if values else 50  # Default
+            for i in range(nstates):
+                if i < len(values):
+                    last_vmax = int(values[i])
+                self.job.vibmax[i + 1] = last_vmax  # Fill forward
+
+        # Parse ENERMAX (energy cutoff for vibrational states per electronic state)
+        # Same fill-forward behavior as vmax
+        # Format: "enermax 50000.0" or "enermax 50000.0 40000.0 40000.0 ..."
+        enermax_pattern = r'(?i)enermax\s+([\d\.\s\+\-eE]+)'
+        match = re.search(enermax_pattern, contraction_content)
+        if match:
+            values = self._extract_numbers(match.group(1))
+            nstates = len(self.states)
+            last_enermax = float(values[0]) if values else 1e9  # Default (very large)
+            for i in range(nstates):
+                if i < len(values):
+                    last_enermax = float(values[i])
+                self.job.vibenermax[i + 1] = last_enermax  # Fill forward
 
     def _find_section_end(self, content: str, start: int) -> int:
         """Find the end of a section (next keyword or END)."""
@@ -1175,3 +1224,29 @@ class InputParser:
                         ab_field.jstate == coupling.jstate):
                         coupling.abinitio_field = ab_field
                         break
+
+    def _set_field_parities(self):
+        """
+        Set parity_i and parity_j on spin-orbit and coupling fields
+        based on the electronic states' parity_pm values.
+
+        This is needed for the molpro_duo transformation to work correctly.
+        """
+        # Build a lookup from istate to parity_pm
+        state_parity = {}
+        for state in self.states:
+            state_parity[state.istate] = state.parity_pm
+
+        # Set parities on spin-orbit fields
+        for so in self.spinorbit:
+            if so.istate in state_parity:
+                so.parity_i = state_parity[so.istate]
+            if so.jstate in state_parity:
+                so.parity_j = state_parity[so.jstate]
+
+        # Set parities on coupling fields (LXLY, L+, etc.)
+        for coupling in self.couplings:
+            if coupling.istate in state_parity:
+                coupling.parity_i = state_parity[coupling.istate]
+            if coupling.jstate in state_parity:
+                coupling.parity_j = state_parity[coupling.jstate]

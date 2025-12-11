@@ -79,7 +79,8 @@ class FieldBase:
     # Morphing support - multiply analytic function by ab initio data
     morphing: bool = False
     abinitio_field: Any = None  # Reference to AbInitioField when morphing
-    factor: float = 1.0         # Scaling factor from input
+    factor: float = 1.0         # Scaling factor from input (real part)
+    complex_f: complex = 1.0+0j # Complex factor (for imaginary factors like 'i')
 
     # MOLPRO <x|Lz|y> representation parameters for basis transformation
     # When non-zero, the molpro_duo transformation is applied (sqrt(2) factors)
@@ -810,39 +811,150 @@ class SpinOrbitField(FieldBase):
 
     def _apply_molpro_transformation(self, values, xp):
         """
-        Apply MOLPRO to Duo basis transformation.
+        Apply MOLPRO to Duo basis transformation for spin-orbit fields.
 
-        When using spin-orbit-x with <x|Lz|y> representation from MOLPRO,
-        a basis transformation from Cartesian (|x>, |y>) to spherical (|+1>, |-1>)
-        is needed. This transformation introduces a factor of sqrt(2).
+        This implements the full transformation from Duo's molpro_duo subroutine:
+        1. Build eigenvector matrices a and b from <x|Lz|y> values
+        2. Build coupling matrix according to ix_lz_y/jx_lz_y combinations
+        3. Transform: f_t = a† @ coupling @ b
+        4. Return values scaled by real(f_t[0,0])
 
-        In Duo's diatom.f90 (molpro_duo subroutine), this is done via:
-        f_t = matmul(conjg(transpose(a)), matmul(coupling, b))
-        where a and b are eigenvector matrices.
-
-        For the common case where one lambda=0 and one lambda!=0:
-        - The final gridvalue = coupling(1,1) * sqrt(2)
-
-        This function applies the sqrt(2) factor for MOLPRO representation.
+        The transformation depends on:
+        - ix_lz_y and jx_lz_y values (0 for Sigma, +/-1 for Pi states)
+        - Parity of the states involved
         """
-        # Only apply transformation if <x|Lz|y> was specified
+        # Build transformation matrices a and b (2x2 complex)
+        a, b = self._build_molpro_matrices()
+
+        # Compute transformation factor based on case
+        transform_factor = self._compute_spinorbit_transform_factor(a, b)
+
+        return values * transform_factor
+
+    def _build_molpro_matrices(self):
+        """Build the a and b transformation matrices for molpro_duo."""
+        # Default: identity
+        a = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
+        b = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
+
+        # If ix_lz_y != 0, build a from diagonalization of Lz-like matrix
+        if self.ix_lz_y != 0:
+            a = self._build_lz_eigenvector_matrix(self.ix_lz_y)
+        elif self.parity_i == -1:
+            # For Sigma- states with parity=-1, a(1,1) = i
+            a[0, 0] = 1j
+
+        # If jx_lz_y != 0, build b from diagonalization
+        if self.jx_lz_y != 0:
+            b = self._build_lz_eigenvector_matrix(self.jx_lz_y)
+        elif self.parity_j == -1:
+            b[0, 0] = 1j
+
+        return a, b
+
+    def _build_lz_eigenvector_matrix(self, lz_value):
+        """
+        Build the eigenvector matrix for the Lz-like matrix analytically.
+
+        For the matrix [[0, i*lz], [-i*lz, 0]], the eigenvalues are +|lz| and -|lz|.
+        The eigenvectors (following Duo's convention with positive eigenvalue first):
+        - For lz > 0: eigenvector for +lz is [1, -i]/sqrt(2), for -lz is [1, i]/sqrt(2)
+        - For lz < 0: eigenvector for +|lz| is [1, i]/sqrt(2), for -|lz| is [1, -i]/sqrt(2)
+
+        After multiplying by i (Duo convention):
+        - For lz > 0: [i, 1]/sqrt(2) and [i, -1]/sqrt(2)
+        - For lz < 0: [i, -1]/sqrt(2) and [i, 1]/sqrt(2)
+
+        Returns the matrix with columns as eigenvectors, positive eigenvalue first.
+        """
+        sqrt2 = np.sqrt(2.0)
+
+        if lz_value > 0:
+            # Eigenvalues: +lz, -lz (positive first after Duo convention)
+            # Eigenvector for +lz: [1, -i]/sqrt(2), after *i: [i, 1]/sqrt(2)
+            # Eigenvector for -lz: [1, i]/sqrt(2), after *i: [i, -1]/sqrt(2)
+            result = np.array([
+                [1j/sqrt2, 1j/sqrt2],
+                [1.0/sqrt2, -1.0/sqrt2]
+            ], dtype=np.complex128)
+        else:
+            # lz_value < 0: eigenvalues are -lz (positive), lz (negative)
+            # Eigenvalues: +|lz|, -|lz| = -lz, lz
+            # Eigenvector for -lz: [1, i]/sqrt(2), after *i: [i, -1]/sqrt(2)
+            # Eigenvector for lz: [1, -i]/sqrt(2), after *i: [i, 1]/sqrt(2)
+            result = np.array([
+                [1j/sqrt2, 1j/sqrt2],
+                [-1.0/sqrt2, 1.0/sqrt2]
+            ], dtype=np.complex128)
+
+        return result
+
+    def _compute_spinorbit_transform_factor(self, a, b):
+        """
+        Compute the transformation factor for spin-orbit fields.
+
+        This implements the coupling matrix construction and transformation
+        from Duo's molpro_duo subroutine for SPINORBIT fields.
+        """
+        c = self.complex_f  # complex factor from input
+
+        # Case 1: Both ix_lz_y == 0 and jx_lz_y == 0
         if self.ix_lz_y == 0 and self.jx_lz_y == 0:
-            return values
+            # coupling(1,1) = gridvalue * complex_f
+            # f_t = a† @ coupling @ b where a, b are identity (or have i on diagonal for Sigma-)
+            # f_t[0,0] = conj(a[0,0]) * c * b[0,0]
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            coupling[0, 0] = c
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
-        # Case: ix_lz_y == 0 and jx_lz_y != 0 (e.g., Sigma-Pi coupling)
-        # The transformation gives a sqrt(2) factor
-        if (self.ix_lz_y == 0 and self.jx_lz_y != 0) or \
-           (self.ix_lz_y != 0 and self.jx_lz_y == 0):
-            return values * xp.sqrt(2.0)
+        # Case 2: ix_lz_y != 0 and jx_lz_y == 0 (bra is Pi, ket is Sigma)
+        elif self.ix_lz_y != 0 and self.jx_lz_y == 0:
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            if self.parity_j == -1:
+                # Regular case: <Pi|SO|Sigma->
+                coupling[0, 0] = c
+                coupling[1, 0] = -c * np.conj(a[0, 1] / a[1, 1])
+            else:
+                # Irregular case: <Pi|SO|Sigma+>
+                coupling[1, 0] = c
+                coupling[0, 0] = -c * np.conj(a[1, 1] / a[0, 1])
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
-        # Case: both non-zero but different magnitudes (e.g., Pi-Delta)
-        # Also gives sqrt(2) factor
-        if abs(self.ix_lz_y) != abs(self.jx_lz_y):
-            return values * xp.sqrt(2.0)
+        # Case 3: ix_lz_y == 0 and jx_lz_y != 0 (bra is Sigma, ket is Pi)
+        elif self.ix_lz_y == 0 and self.jx_lz_y != 0:
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            if self.parity_i == -1:
+                # Regular case: <Sigma-|SO|Pi>
+                coupling[0, 0] = c
+                coupling[0, 1] = -c * b[0, 1] / b[1, 1]
+            else:
+                # Irregular case: <Sigma+|SO|Pi>
+                coupling[0, 1] = c
+                coupling[0, 0] = -c * b[1, 1] / b[0, 1]
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
-        # Case: both non-zero and same magnitude (e.g., diagonal Pi-Pi)
-        # No additional factor
-        return values
+        # Case 4: Both non-zero with different absolute values (Pi-Pi with different Lambda)
+        elif abs(self.ix_lz_y) != abs(self.jx_lz_y):
+            # <Pi_i|SO|Pi_j> where Lambda_i != Lambda_j
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            coupling[0, 0] = -c * b[1, 1] / b[0, 1]
+            coupling[0, 1] = c
+            coupling[1, 0] = c * np.conj(a[0, 1] / a[1, 1]) * b[1, 1] / b[0, 1]
+            coupling[1, 1] = -c * np.conj(a[0, 1] / a[1, 1])
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
+
+        # Case 5: Both non-zero with same absolute values (diagonal spin-orbit, SOZ)
+        else:
+            # <Pi|SOZ|Pi> same state
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            coupling[0, 1] = c
+            coupling[1, 0] = -np.conj(a[0, 0]) * c * b[1, 1] / (np.conj(a[1, 0]) * b[0, 1])
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
     def _polynomial(self, r, params, xp):
         """Polynomial expansion using Horner's method (GPU-efficient)."""
@@ -975,32 +1087,116 @@ class CouplingField(FieldBase):
 
     def _apply_molpro_transformation(self, values, xp):
         """
-        Apply MOLPRO to Duo basis transformation for L+ couplings.
+        Apply MOLPRO to Duo basis transformation for coupling fields (L+, LXLY, etc.).
 
-        When using Lx with <x|Lz|y> representation from MOLPRO,
-        a basis transformation from Cartesian (|x>, |y>) to spherical (|+1>, |-1>)
-        is needed. This transformation introduces a factor of -sqrt(2) for L+ couplings.
-
-        The negative sign arises from the matrix transformation in molpro_duo:
-        coupling(1,1) = -c*b(2,2)/b(1,2)
-        which differs from spin-orbit where there's no leading negative sign.
+        This implements the full transformation from Duo's molpro_duo subroutine
+        for L+ type couplings. The logic is similar to spin-orbit but with
+        different coupling matrix construction.
         """
-        # Only apply transformation if <x|Lz|y> was specified
+        # Build transformation matrices a and b
+        a, b = self._build_molpro_matrices()
+
+        # Compute transformation factor based on field type and ix_lz_y/jx_lz_y
+        transform_factor = self._compute_lplus_transform_factor(a, b)
+
+        return values * transform_factor
+
+    def _build_molpro_matrices(self):
+        """Build the a and b transformation matrices for molpro_duo."""
+        # Default: identity
+        a = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
+        b = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
+
+        if self.ix_lz_y != 0:
+            a = self._build_lz_eigenvector_matrix(self.ix_lz_y)
+        elif self.parity_i == -1:
+            a[0, 0] = 1j
+
+        if self.jx_lz_y != 0:
+            b = self._build_lz_eigenvector_matrix(self.jx_lz_y)
+        elif self.parity_j == -1:
+            b[0, 0] = 1j
+
+        return a, b
+
+    def _build_lz_eigenvector_matrix(self, lz_value):
+        """
+        Build the eigenvector matrix for the Lz-like matrix analytically.
+        Same as SpinOrbitField._build_lz_eigenvector_matrix.
+        """
+        sqrt2 = np.sqrt(2.0)
+
+        if lz_value > 0:
+            result = np.array([
+                [1j/sqrt2, 1j/sqrt2],
+                [1.0/sqrt2, -1.0/sqrt2]
+            ], dtype=np.complex128)
+        else:
+            result = np.array([
+                [1j/sqrt2, 1j/sqrt2],
+                [-1.0/sqrt2, 1.0/sqrt2]
+            ], dtype=np.complex128)
+
+        return result
+
+    def _compute_lplus_transform_factor(self, a, b):
+        """
+        Compute the transformation factor for L+/LX coupling fields.
+
+        This implements the coupling matrix construction from Duo's molpro_duo
+        for L+ (ABINITIO-LX, ABINITIO-L+, MAGNETIC) field types.
+        """
+        c = self.complex_f
+
+        # Case 1: Both ix_lz_y == 0 and jx_lz_y == 0
         if self.ix_lz_y == 0 and self.jx_lz_y == 0:
-            return values
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            coupling[0, 0] = c
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
-        # For L+ (LXLY) couplings, the transformation gives -sqrt(2)
-        if (self.ix_lz_y == 0 and self.jx_lz_y != 0) or \
-           (self.ix_lz_y != 0 and self.jx_lz_y == 0):
-            return values * (-xp.sqrt(2.0))
+        # Case 2: ix_lz_y != 0 and jx_lz_y == 0 (Pi to Sigma)
+        elif self.ix_lz_y != 0 and self.jx_lz_y == 0:
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            if self.parity_j == -1:
+                coupling[0, 0] = c
+                coupling[1, 0] = -c * np.conj(a[0, 1] / a[1, 1])
+            else:
+                coupling[1, 0] = c
+                coupling[0, 0] = -c * np.conj(a[1, 1] / a[0, 1])
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
-        # Case: both non-zero but different magnitudes (e.g., Pi-Delta)
-        if abs(self.ix_lz_y) != abs(self.jx_lz_y):
-            return values * (-xp.sqrt(2.0))
+        # Case 3: ix_lz_y == 0 and jx_lz_y != 0 (Sigma to Pi)
+        elif self.ix_lz_y == 0 and self.jx_lz_y != 0:
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            if self.parity_i == -1:
+                coupling[0, 0] = c
+                coupling[0, 1] = -c * b[0, 1] / b[1, 1]
+            else:
+                coupling[0, 1] = c
+                coupling[0, 0] = -c * b[1, 1] / b[0, 1]
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
-        # Case: both non-zero and same magnitude (e.g., diagonal Pi-Pi)
-        # No additional factor
-        return values
+        # Case 4: Both non-zero with different absolute values (Pi-Pi different Lambda)
+        elif abs(self.ix_lz_y) != abs(self.jx_lz_y):
+            # L+ coupling between different Pi states
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            coupling[0, 0] = -c * b[1, 1] / b[0, 1]
+            coupling[0, 1] = c
+            coupling[1, 0] = c * np.conj(a[0, 1] / a[1, 1]) * b[1, 1] / b[0, 1]
+            coupling[1, 1] = -c * np.conj(a[0, 1] / a[1, 1])
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
+
+        # Case 5: Same absolute values (diagonal case)
+        else:
+            coupling = np.zeros((2, 2), dtype=np.complex128)
+            coupling[0, 1] = c
+            coupling[1, 0] = -np.conj(a[0, 0]) * c * b[1, 1] / (np.conj(a[1, 0]) * b[0, 1])
+            f_t = np.conj(a.T) @ coupling @ b
+            return f_t[0, 0].real
 
     def _polynomial(self, r, params, xp):
         """Polynomial expansion using Horner's method (GPU-efficient)."""
