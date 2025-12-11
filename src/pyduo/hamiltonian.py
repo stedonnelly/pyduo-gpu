@@ -6,6 +6,7 @@ Includes all coupling terms: spin-orbit, spin-spin, L^2, etc.
 """
 
 import numpy as np
+import scipy.linalg
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
@@ -1519,56 +1520,61 @@ class HamiltonianBuilder:
                 # Symmetrize
                 hsym = (hsym + hsym.T) / 2.0
 
-                # Diagonalize on GPU
-                hsym_gpu = cp.asarray(hsym)
-                eigenvalues, eigenvectors = cp.linalg.eigh(hsym_gpu)
-                eigenvalues_np = cp.asnumpy(eigenvalues) / sc
-                eigenvectors_np = cp.asnumpy(eigenvectors)
+                # Diagonalize using SYEV (same as Duo) for consistent eigenvector ordering
+                hsym_np = cp.asnumpy(hsym) if hasattr(hsym, 'get') else hsym
+                eigenvalues, eigenvectors = scipy.linalg.eigh(hsym_np, driver='ev')
+                eigenvalues_np = eigenvalues / sc
+                eigenvectors_np = eigenvectors
 
-                # Create eigenstates using expectation value matching
-                # Use precomputed block_quanta for quantum number lookup
-                used_imaxcontr = set()
-
-                # Precompute quantum number arrays for this block
-                block_omegas = np.array([q.omega for q in block_quanta])
-                block_sigmas = np.array([q.sigma for q in block_quanta])
-                block_vs = np.array([q.v for q in block_quanta])
-                block_istates = np.array([q.istate for q in block_quanta])
+                # Assign quantum numbers using EXACTLY Duo's approach:
+                # imaxcontr = argmax of coefficient^2, with duplicate avoidance
+                # This matches Duo's diatom.f90 lines 10015-10052
+                QNs = [None] * len(eigenvalues_np)
+                small_ = 1e-12
 
                 for iroot in range(len(eigenvalues_np)):
                     energy = eigenvalues_np[iroot]
                     coeffs = eigenvectors_np[:, iroot]
                     coeffs_sq = coeffs ** 2
 
-                    # Compute expectation values of quantum numbers
-                    omega_exp = np.sum(coeffs_sq * block_omegas)
-                    sigma_exp = np.sum(coeffs_sq * block_sigmas)
-                    v_exp = np.sum(coeffs_sq * block_vs)
-                    istate_exp = np.sum(coeffs_sq * block_istates)
+                    # Find largest coefficient (Duo: maxloc)
+                    # Use tolerance-based tie-breaking to match Fortran's maxloc
+                    tol = 1e-6
+                    max_val = np.max(coeffs_sq)
+                    if max_val > 0:
+                        near_max_mask = coeffs_sq >= max_val * (1.0 - tol)
+                        near_max_indices = np.where(near_max_mask)[0]
+                        imaxcontr = int(near_max_indices[0])
+                    else:
+                        imaxcontr = int(np.argmax(coeffs_sq))
+                    maxcontr = coeffs_sq[imaxcontr]
 
-                    # Find unused level closest to expectation values
-                    best_idx = None
-                    best_dist = float('inf')
+                    # Check if already used, take second largest if so (Duo's loop_check)
+                    i0 = 0
+                    while True:
+                        found_duplicate = False
+                        for ilevel_prev in range(iroot):
+                            if QNs[ilevel_prev] is not None and imaxcontr == QNs[ilevel_prev]:
+                                # Find next largest that's smaller than current max
+                                mask2 = (coeffs_sq >= small_) & (coeffs_sq < maxcontr)
+                                if np.any(mask2):
+                                    masked_coeffs2 = np.where(mask2, coeffs_sq, -np.inf)
+                                    max_val2 = np.max(masked_coeffs2)
+                                    near_max_mask2 = masked_coeffs2 >= max_val2 * (1.0 - tol)
+                                    near_max_indices2 = np.where(near_max_mask2)[0]
+                                    imaxcontr = int(near_max_indices2[0])
+                                    maxcontr = coeffs_sq[imaxcontr]
+                                i0 += 1
+                                if i0 > 10:
+                                    imaxcontr = int(np.argmax(coeffs_sq))
+                                    break
+                                found_duplicate = True
+                                break
+                        if not found_duplicate or i0 > 10:
+                            break
 
-                    for idx in range(len(block_quanta)):
-                        if idx in used_imaxcontr:
-                            continue
-
-                        q = block_quanta[idx]
-                        dist = (10.0 * abs(q.istate - istate_exp) +
-                                5.0 * abs(q.v - v_exp) +
-                                1.0 * abs(q.omega - omega_exp) +
-                                0.5 * abs(q.sigma - sigma_exp))
-
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_idx = idx
-
-                    if best_idx is None:
-                        best_idx = np.argmax(coeffs_sq)
-
-                    used_imaxcontr.add(best_idx)
-                    basis_state = block_quanta[best_idx]
+                    QNs[iroot] = imaxcontr
+                    basis_state = block_quanta[imaxcontr]
 
                     eigenstate = EigenState(
                         energy=energy,
@@ -2615,7 +2621,7 @@ class HamiltonianBuilder:
             spini = state_i.spin
             omegai = state_i.omega
             istate_i = state_i.istate
-            ivib = state_i.ivib
+            ivib = state_i.v  # Use v (vibrational quantum number) to match Duo
 
             # Case 1: Lambda=0 and Sigma=0 (single state, no pair)
             if ilambda == 0 and abs(sigmai) < 0.5:
@@ -2653,7 +2659,7 @@ class HamiltonianBuilder:
                     sigmaj = state_j.sigma
                     spinj = state_j.spin
                     jstate_j = state_j.jstate if hasattr(state_j, 'jstate') else state_j.istate
-                    jvib = state_j.ivib
+                    jvib = state_j.v  # Use v (vibrational quantum number) to match Duo
 
                     # Check if j is the paired state: opposite lambda and sigma, same state/vib/spin
                     if (ilambda == -jlambda and
@@ -2852,14 +2858,14 @@ class HamiltonianBuilder:
             # Symmetrize
             hsym = (hsym + hsym.T) / 2.0
 
-            # Diagonalize
+            # Diagonalize using SYEV (same as Duo) instead of SYEVD
+            # This ensures consistent eigenvector ordering for degenerate/near-degenerate states
             if self.use_gpu:
-                hsym_gpu = cp.asarray(hsym)
-                eigenvalues, eigenvectors = cp.linalg.eigh(hsym_gpu)
-                eigenvalues = cp.asnumpy(eigenvalues)
-                eigenvectors = cp.asnumpy(eigenvectors)
+                # For GPU: transfer to CPU, use scipy SYEV, transfer back
+                hsym_np = cp.asnumpy(hsym) if hasattr(hsym, 'get') else hsym
+                eigenvalues, eigenvectors = scipy.linalg.eigh(hsym_np, driver='ev')
             else:
-                eigenvalues, eigenvectors = np.linalg.eigh(hsym)
+                eigenvalues, eigenvectors = scipy.linalg.eigh(hsym, driver='ev')
 
             # Convert from scaled units
             eigenvalues = eigenvalues / sc
