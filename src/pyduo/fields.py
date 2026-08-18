@@ -93,6 +93,178 @@ class FieldBase:
         """Evaluate the field at given r values."""
         raise NotImplementedError("Subclasses must implement evaluate()")
 
+    def molpro_duo_factor(self, field_class: str) -> float:
+        """Faithful transcription of Duo's molpro_duo (diatom.f90:5733-6247).
+
+        Transforms a MOLPRO Cartesian-representation matrix element into Duo's
+        spherical |Lambda| representation. Returns the real scalar the
+        (factor-scaled, morphed) grid values must be multiplied by, and
+        updates self.lambda_i / self.lambda_j to the transformed signed
+        values exactly as Duo overwrites field%lambda / field%lambdaj.
+
+        field_class: 'SPINORBIT' or 'L+'.
+
+        Notes vs the previous implementation [audit: SO transform bug]:
+        - the eigenvector matrices a, b are obtained numerically (eigh of the
+          Hermitian [[0, i*k], [-i*k, 0]]), positive eigenvalue first, then
+          multiplied by i (Duo lines 5757-5805), with a deterministic column
+          phase (second component real >= 0);
+        - Duo's selection-rule column swapping (5820-5878), driven by
+          round(sigma_j - sigma_i), is implemented -- it fires for every
+          Sigma-Pi spin-orbit field whose dSigma requires the -|Lambda| root;
+        - the complex factor is PHASE-ONLY here: apply_morphing has already
+          multiplied the real self.factor into the values, so we divide it
+          out of complex_f (fixes the real-factor double application);
+        - the result must be real; Duo stops otherwise ("use FACTOR I") --
+          we warn loudly instead of silently taking .real of an imaginary
+          number (which is what used to zero out every Sigma-Pi SO field).
+        """
+        import warnings
+
+        if getattr(self, '_molpro_factor_cache', None) is not None:
+            return self._molpro_factor_cache
+
+        ix, jx = self.ix_lz_y, self.jx_lz_y
+
+        # Phase-only complex factor (real magnitude already applied in morphing)
+        c = self.complex_f
+        if abs(self.factor) > 1e-300:
+            c = c / self.factor
+
+        def lz_eigvec(k):
+            """Eigenvectors of [[0, i*k], [-i*k, 0]], positive eigenvalue
+            first, times i -- Duo 5757-5776.
+
+            Column phases are fixed to LAPACK zheev's convention, which Duo
+            inherits (validated against Duo's printed transformed SO curves,
+            tracking/reference/cao_j0-4.out): the second component is real,
+            with the SIGN OF THE EIGENVALUE (v(+|k|)[1] > 0, v(-|k|)[1] < 0).
+            """
+            m = np.array([[0.0, 1j * k], [-1j * k, 0.0]], dtype=np.complex128)
+            w, v = np.linalg.eigh(m)          # ascending eigenvalues
+            v = v[:, ::-1]                    # positive first
+            w = w[::-1]
+            for col in range(2):
+                ref = v[1, col]
+                if abs(ref) > 1e-12:
+                    v[:, col] *= np.conj(ref) / abs(ref)   # second comp real +
+                    if w[col] < 0:
+                        v[:, col] *= -1.0                  # real - for the -|k| root
+            v = v * 1j                        # Duo line 5776 / 5805
+            return v, [int(round(w[0])), int(round(w[1]))]
+
+        a = np.eye(2, dtype=np.complex128)
+        b = np.eye(2, dtype=np.complex128)
+        lam_i_roots = None
+        lam_j_roots = None
+        lam_i = self.lambda_i
+        lam_j = self.lambda_j
+
+        if ix != 0:
+            a, lam_i_roots = lz_eigvec(ix)
+            lam_i = lam_i_roots[0]
+        elif self.parity_i == -1:
+            a[0, 0] = 1j
+
+        if jx != 0:
+            b, lam_j_roots = lz_eigvec(jx)
+            lam_j = lam_j_roots[0]
+        elif self.parity_j == -1:
+            b[0, 0] = 1j
+
+        # --- selection-rule column swapping (SPINORBIT only, Duo 5820-5878) ---
+        if field_class == 'SPINORBIT':
+            dsig = int(round(self.sigma_j - self.sigma_i))
+            if dsig != lam_i - lam_j:
+                if lam_i != 0 and lam_i_roots and dsig == lam_i_roots[1] - lam_j:
+                    a = a[:, ::-1].copy()
+                    lam_i_roots = lam_i_roots[::-1]
+                    lam_i = lam_i_roots[0]
+                elif lam_j != 0 and lam_j_roots and dsig == lam_i - lam_j_roots[1]:
+                    b = b[:, ::-1].copy()
+                    lam_j_roots = lam_j_roots[::-1]
+                    lam_j = lam_j_roots[0]
+                elif (lam_j != 0 and lam_i_roots and lam_j_roots and
+                      dsig == lam_i_roots[1] - lam_j_roots[1]):
+                    a = a[:, ::-1].copy()
+                    lam_i_roots = lam_i_roots[::-1]
+                    lam_i = lam_i_roots[0]
+                    b = b[:, ::-1].copy()
+                    lam_j_roots = lam_j_roots[::-1]
+                    lam_j = lam_j_roots[0]
+                else:
+                    raise ValueError(
+                        f"molpro_duo: cannot find selection rule for field "
+                        f"{self.name}: sigma=({self.sigma_i},{self.sigma_j}), "
+                        f"lambda=({lam_i},{lam_j})")
+
+        # --- coupling matrix (Duo 5900-6218), with unit gridvalue ---
+        C = np.zeros((2, 2), dtype=np.complex128)
+        if ix == 0 and jx == 0:
+            C[0, 0] = c
+        elif ix != 0 and jx == 0:
+            if field_class == 'SPINORBIT' and \
+                    abs(int(round(self.sigma_j - self.sigma_i))) != abs(lam_i - lam_j):
+                raise ValueError(f"molpro_duo: SO {self.name}: illegal selection rules")
+            if self.parity_j == -1:   # regular
+                C[0, 0] = c
+                C[1, 0] = -C[0, 0] * np.conj(a[0, 1] / a[1, 1])
+            else:                     # irregular
+                C[1, 0] = c
+                C[0, 0] = -C[1, 0] * np.conj(a[1, 1] / a[0, 1])
+        elif ix == 0 and jx != 0:
+            if field_class == 'SPINORBIT' and \
+                    abs(int(round(self.sigma_j - self.sigma_i))) != abs(lam_i - lam_j):
+                raise ValueError(f"molpro_duo: SO {self.name}: illegal selection rules")
+            if self.parity_i == -1:   # regular
+                C[0, 0] = c
+                C[0, 1] = -C[0, 0] * b[0, 1] / b[1, 1]
+            else:                     # irregular
+                C[0, 1] = c
+                C[0, 0] = -C[0, 1] * b[1, 1] / b[0, 1]
+        elif abs(ix) != abs(jx):
+            if field_class == 'SPINORBIT' and \
+                    abs(int(round(self.sigma_j - self.sigma_i))) != abs(lam_i - lam_j):
+                raise ValueError(f"molpro_duo: SO {self.name}: illegal selection rules")
+            if field_class == 'L+' and abs(lam_i - lam_j) != 1:
+                raise ValueError(f"molpro_duo: L+ {self.name}: |dLambda| != 1")
+            C[0, 0] = -c * b[1, 1] / b[0, 1]
+            C[0, 1] = c
+            C[1, 0] = c * np.conj(a[0, 1] / a[1, 1]) * b[1, 1] / b[0, 1]
+            C[1, 1] = -c * np.conj(a[0, 1] / a[1, 1])
+        else:  # |ix| == |jx|, both non-zero
+            if field_class == 'SPINORBIT':
+                if int(round(self.sigma_j - self.sigma_i)) != 0:
+                    raise ValueError(f"molpro_duo: SOZ {self.name}: illegal selection rules")
+                C[0, 1] = c
+                C[1, 0] = -np.conj(a[0, 0]) * c * b[1, 1] / (np.conj(a[1, 0]) * b[0, 1])
+            else:
+                raise NotImplementedError(
+                    f"molpro_duo: {field_class} with |ix|==|jx| is not "
+                    f"implemented in Duo either ({self.name})")
+
+        f_t = a.conj().T @ C @ b
+
+        scale = max(1.0, float(np.abs(f_t).max()))
+        if float(np.abs(f_t.imag).max()) > 1e-10 * scale:
+            warnings.warn(
+                f"molpro_duo: field {self.name} transforms to COMPLEX values "
+                f"(f_t={f_t.tolist()}); check the MOLPRO input and use "
+                f"FACTOR I if required -- taking the real part is wrong")
+
+        factor_out = float(f_t[0, 0].real)
+        if abs(factor_out) <= 1e-8 and abs(c) > 1e-8:
+            warnings.warn(
+                f"molpro_duo: field {self.name} transformed to ZERO -- the "
+                f"coupling would silently vanish (Duo stops here)")
+
+        # Duo overwrites field%lambda / field%lambdaj with the signed values
+        self.lambda_i = lam_i
+        self.lambda_j = lam_j
+
+        self._molpro_factor_cache = factor_out
+        return factor_out
+
     def apply_morphing(self, analytic_values, r, use_gpu: bool = True):
         """
         Apply morphing by multiplying analytic values by ab initio data.
@@ -120,6 +292,15 @@ class FieldBase:
         result = analytic_values * self.factor
 
         # Then apply morphing if enabled
+        if self.morphing and self.abinitio_field is None:
+            # Duo ABORTS here (diatom.f90:5485-5492: zero abinitio partner).
+            # Silently skipping would leave the bare dimensionless morphing
+            # polynomial (~1) in place of a cm-1 coupling curve.
+            import warnings
+            warnings.warn(
+                f"field {self.name}: 'morphing' declared but no abinitio "
+                f"partner was linked -- the field is NOT morphed (Duo stops "
+                f"here); check the abinitio section")
         if self.morphing and self.abinitio_field is not None:
             # Get ab initio values on the same grid
             abinitio_values = self.abinitio_field.evaluate(r, use_gpu=use_gpu)
@@ -245,42 +426,49 @@ class AbInitioField:
         else:
             r_np = np.array(r)
 
-        # Use scipy for interpolation (CPU)
+        # Duo-exact interpolation [audit: interpolation residual]:
+        # Duo EXTENDS the tabulated grid with 20 linearly-extrapolated guide
+        # points at each end -- reaching one step BEYOND rmin/rmax of the
+        # computation grid (diatom.f90:4954-4987 short end: xx(i) = rmin +
+        # (grid1 - rmin)*(i-2)/(np-1); 5070-5110 long end: xx(k) = gridN +
+        # (rmax - gridN)*k/(np-1); linear extension through the edge node
+        # pair for non-POTEN/non-DIPOLE classes, 5008-5013 / 5131-5135) and
+        # then builds a NATURAL cubic spline through the EXTENDED set
+        # (grids.f90 spline/splint, natural BCs). Splining only the raw
+        # nodes differs from Duo even INSIDE the data range (the natural
+        # boundary condition moves), which produced structured ~1e-2 cm-1
+        # level errors. Verified against Duo's printed transformed SO curves:
+        # this scheme reproduces them to ~4e-9 (printed precision).
         from scipy.interpolate import CubicSpline
 
         if self._spline_coeffs is None:
-            # Build spline - don't extrapolate, we'll handle that separately
-            self._spline_coeffs = CubicSpline(
-                self.grid_r, self.grid_values,
-                bc_type='natural', extrapolate=False
-            )
+            rmin = float(np.min(r_np))
+            rmax = float(np.max(r_np))
+            xs = self.grid_r
+            ys = self.grid_values
+            NP = 20
+            parts_x = [xs]
+            parts_y = [ys]
+            if xs[0] > rmin:
+                i = np.arange(1, NP + 1, dtype=float)
+                x_lo = rmin + (xs[0] - rmin) * (i - 2.0) / (NP - 1.0)
+                slope = (ys[0] - ys[1]) / (xs[0] - xs[1])
+                y_lo = ys[0] + (x_lo - xs[0]) * slope
+                parts_x.insert(0, x_lo)
+                parts_y.insert(0, y_lo)
+            if xs[-1] < rmax:
+                k = np.arange(1, NP + 1, dtype=float)
+                x_hi = xs[-1] + (rmax - xs[-1]) * k / (NP - 1.0)
+                slope = (ys[-2] - ys[-1]) / (xs[-2] - xs[-1])
+                y_hi = ys[-2] + (x_hi - xs[-2]) * slope
+                parts_x.append(x_hi)
+                parts_y.append(y_hi)
+            X = np.concatenate(parts_x)
+            Y = np.concatenate(parts_y)
+            self._spline_coeffs = CubicSpline(X, Y, bc_type='natural',
+                                              extrapolate=True)
 
-        # Evaluate spline for points within range
-        values = np.zeros_like(r_np)
-        r_min, r_max = self.grid_r[0], self.grid_r[-1]
-
-        # Points within the grid range - use cubic spline
-        in_range = (r_np >= r_min) & (r_np <= r_max)
-        if np.any(in_range):
-            values[in_range] = self._spline_coeffs(r_np[in_range])
-
-        # Points below the grid range - use linear extrapolation (like Duo)
-        below_range = r_np < r_min
-        if np.any(below_range):
-            # Linear extrapolation using first two points
-            x1, x2 = self.grid_r[0], self.grid_r[1]
-            y1, y2 = self.grid_values[0], self.grid_values[1]
-            slope = (y2 - y1) / (x2 - x1)
-            values[below_range] = y1 + (r_np[below_range] - x1) * slope
-
-        # Points above the grid range - use linear extrapolation
-        above_range = r_np > r_max
-        if np.any(above_range):
-            # Linear extrapolation using last two points
-            x1, x2 = self.grid_r[-2], self.grid_r[-1]
-            y1, y2 = self.grid_values[-2], self.grid_values[-1]
-            slope = (y2 - y1) / (x2 - x1)
-            values[above_range] = y2 + (r_np[above_range] - x2) * slope
+        values = self._spline_coeffs(r_np)
 
         if use_gpu and HAS_CUDA:
             return cp.asarray(values)
@@ -810,151 +998,13 @@ class SpinOrbitField(FieldBase):
         return result
 
     def _apply_molpro_transformation(self, values, xp):
+        """MOLPRO Cartesian -> Duo spherical transformation for spin-orbit.
+
+        Delegates to the faithful FieldBase.molpro_duo_factor transcription
+        (the previous per-case reimplementation zeroed out every Sigma-Pi
+        SO-X field with an imaginary factor).  [audit: SO transform bug]
         """
-        Apply MOLPRO to Duo basis transformation for spin-orbit fields.
-
-        This implements the full transformation from Duo's molpro_duo subroutine:
-        1. Build eigenvector matrices a and b from <x|Lz|y> values
-        2. Build coupling matrix according to ix_lz_y/jx_lz_y combinations
-        3. Transform: f_t = a† @ coupling @ b
-        4. Return values scaled by real(f_t[0,0])
-
-        The transformation depends on:
-        - ix_lz_y and jx_lz_y values (0 for Sigma, +/-1 for Pi states)
-        - Parity of the states involved
-        """
-        # Build transformation matrices a and b (2x2 complex)
-        a, b = self._build_molpro_matrices()
-
-        # Compute transformation factor based on case
-        transform_factor = self._compute_spinorbit_transform_factor(a, b)
-
-        return values * transform_factor
-
-    def _build_molpro_matrices(self):
-        """Build the a and b transformation matrices for molpro_duo."""
-        # Default: identity
-        a = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
-        b = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
-
-        # If ix_lz_y != 0, build a from diagonalization of Lz-like matrix
-        if self.ix_lz_y != 0:
-            a = self._build_lz_eigenvector_matrix(self.ix_lz_y)
-        elif self.parity_i == -1:
-            # For Sigma- states with parity=-1, a(1,1) = i
-            a[0, 0] = 1j
-
-        # If jx_lz_y != 0, build b from diagonalization
-        if self.jx_lz_y != 0:
-            b = self._build_lz_eigenvector_matrix(self.jx_lz_y)
-        elif self.parity_j == -1:
-            b[0, 0] = 1j
-
-        return a, b
-
-    def _build_lz_eigenvector_matrix(self, lz_value):
-        """
-        Build the eigenvector matrix for the Lz-like matrix analytically.
-
-        For the matrix [[0, i*lz], [-i*lz, 0]], the eigenvalues are +|lz| and -|lz|.
-        The eigenvectors (following Duo's convention with positive eigenvalue first):
-        - For lz > 0: eigenvector for +lz is [1, -i]/sqrt(2), for -lz is [1, i]/sqrt(2)
-        - For lz < 0: eigenvector for +|lz| is [1, i]/sqrt(2), for -|lz| is [1, -i]/sqrt(2)
-
-        After multiplying by i (Duo convention):
-        - For lz > 0: [i, 1]/sqrt(2) and [i, -1]/sqrt(2)
-        - For lz < 0: [i, -1]/sqrt(2) and [i, 1]/sqrt(2)
-
-        Returns the matrix with columns as eigenvectors, positive eigenvalue first.
-        """
-        sqrt2 = np.sqrt(2.0)
-
-        if lz_value > 0:
-            # Eigenvalues: +lz, -lz (positive first after Duo convention)
-            # Eigenvector for +lz: [1, -i]/sqrt(2), after *i: [i, 1]/sqrt(2)
-            # Eigenvector for -lz: [1, i]/sqrt(2), after *i: [i, -1]/sqrt(2)
-            result = np.array([
-                [1j/sqrt2, 1j/sqrt2],
-                [1.0/sqrt2, -1.0/sqrt2]
-            ], dtype=np.complex128)
-        else:
-            # lz_value < 0: eigenvalues are -lz (positive), lz (negative)
-            # Eigenvalues: +|lz|, -|lz| = -lz, lz
-            # Eigenvector for -lz: [1, i]/sqrt(2), after *i: [i, -1]/sqrt(2)
-            # Eigenvector for lz: [1, -i]/sqrt(2), after *i: [i, 1]/sqrt(2)
-            result = np.array([
-                [1j/sqrt2, 1j/sqrt2],
-                [-1.0/sqrt2, 1.0/sqrt2]
-            ], dtype=np.complex128)
-
-        return result
-
-    def _compute_spinorbit_transform_factor(self, a, b):
-        """
-        Compute the transformation factor for spin-orbit fields.
-
-        This implements the coupling matrix construction and transformation
-        from Duo's molpro_duo subroutine for SPINORBIT fields.
-        """
-        c = self.complex_f  # complex factor from input
-
-        # Case 1: Both ix_lz_y == 0 and jx_lz_y == 0
-        if self.ix_lz_y == 0 and self.jx_lz_y == 0:
-            # coupling(1,1) = gridvalue * complex_f
-            # f_t = a† @ coupling @ b where a, b are identity (or have i on diagonal for Sigma-)
-            # f_t[0,0] = conj(a[0,0]) * c * b[0,0]
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            coupling[0, 0] = c
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 2: ix_lz_y != 0 and jx_lz_y == 0 (bra is Pi, ket is Sigma)
-        elif self.ix_lz_y != 0 and self.jx_lz_y == 0:
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            if self.parity_j == -1:
-                # Regular case: <Pi|SO|Sigma->
-                coupling[0, 0] = c
-                coupling[1, 0] = -c * np.conj(a[0, 1] / a[1, 1])
-            else:
-                # Irregular case: <Pi|SO|Sigma+>
-                coupling[1, 0] = c
-                coupling[0, 0] = -c * np.conj(a[1, 1] / a[0, 1])
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 3: ix_lz_y == 0 and jx_lz_y != 0 (bra is Sigma, ket is Pi)
-        elif self.ix_lz_y == 0 and self.jx_lz_y != 0:
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            if self.parity_i == -1:
-                # Regular case: <Sigma-|SO|Pi>
-                coupling[0, 0] = c
-                coupling[0, 1] = -c * b[0, 1] / b[1, 1]
-            else:
-                # Irregular case: <Sigma+|SO|Pi>
-                coupling[0, 1] = c
-                coupling[0, 0] = -c * b[1, 1] / b[0, 1]
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 4: Both non-zero with different absolute values (Pi-Pi with different Lambda)
-        elif abs(self.ix_lz_y) != abs(self.jx_lz_y):
-            # <Pi_i|SO|Pi_j> where Lambda_i != Lambda_j
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            coupling[0, 0] = -c * b[1, 1] / b[0, 1]
-            coupling[0, 1] = c
-            coupling[1, 0] = c * np.conj(a[0, 1] / a[1, 1]) * b[1, 1] / b[0, 1]
-            coupling[1, 1] = -c * np.conj(a[0, 1] / a[1, 1])
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 5: Both non-zero with same absolute values (diagonal spin-orbit, SOZ)
-        else:
-            # <Pi|SOZ|Pi> same state
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            coupling[0, 1] = c
-            coupling[1, 0] = -np.conj(a[0, 0]) * c * b[1, 1] / (np.conj(a[1, 0]) * b[0, 1])
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
+        return values * self.molpro_duo_factor('SPINORBIT')
 
     def _polynomial(self, r, params, xp):
         """Polynomial expansion using Horner's method (GPU-efficient)."""
@@ -1086,117 +1136,17 @@ class CouplingField(FieldBase):
         return result
 
     def _apply_molpro_transformation(self, values, xp):
+        """MOLPRO Cartesian -> Duo spherical transformation for couplings.
+
+        Delegates to the faithful FieldBase.molpro_duo_factor transcription.
+        Only L+/LXLY fields are transformed -- Duo's molpro_duo implements
+        SPINORBIT, L+ and DIPOLE classes only; applying it to other coupling
+        types (spin-spin, spin-rot, BOB, lambda-doubling) was never correct
+        and double-applied real factors.  [audit: factor double application]
         """
-        Apply MOLPRO to Duo basis transformation for coupling fields (L+, LXLY, etc.).
-
-        This implements the full transformation from Duo's molpro_duo subroutine
-        for L+ type couplings. The logic is similar to spin-orbit but with
-        different coupling matrix construction.
-        """
-        # Build transformation matrices a and b
-        a, b = self._build_molpro_matrices()
-
-        # Compute transformation factor based on field type and ix_lz_y/jx_lz_y
-        transform_factor = self._compute_lplus_transform_factor(a, b)
-
-        return values * transform_factor
-
-    def _build_molpro_matrices(self):
-        """Build the a and b transformation matrices for molpro_duo."""
-        # Default: identity
-        a = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
-        b = np.array([[1.0+0j, 0.0+0j], [0.0+0j, 1.0+0j]], dtype=np.complex128)
-
-        if self.ix_lz_y != 0:
-            a = self._build_lz_eigenvector_matrix(self.ix_lz_y)
-        elif self.parity_i == -1:
-            a[0, 0] = 1j
-
-        if self.jx_lz_y != 0:
-            b = self._build_lz_eigenvector_matrix(self.jx_lz_y)
-        elif self.parity_j == -1:
-            b[0, 0] = 1j
-
-        return a, b
-
-    def _build_lz_eigenvector_matrix(self, lz_value):
-        """
-        Build the eigenvector matrix for the Lz-like matrix analytically.
-        Same as SpinOrbitField._build_lz_eigenvector_matrix.
-        """
-        sqrt2 = np.sqrt(2.0)
-
-        if lz_value > 0:
-            result = np.array([
-                [1j/sqrt2, 1j/sqrt2],
-                [1.0/sqrt2, -1.0/sqrt2]
-            ], dtype=np.complex128)
-        else:
-            result = np.array([
-                [1j/sqrt2, 1j/sqrt2],
-                [-1.0/sqrt2, 1.0/sqrt2]
-            ], dtype=np.complex128)
-
-        return result
-
-    def _compute_lplus_transform_factor(self, a, b):
-        """
-        Compute the transformation factor for L+/LX coupling fields.
-
-        This implements the coupling matrix construction from Duo's molpro_duo
-        for L+ (ABINITIO-LX, ABINITIO-L+, MAGNETIC) field types.
-        """
-        c = self.complex_f
-
-        # Case 1: Both ix_lz_y == 0 and jx_lz_y == 0
-        if self.ix_lz_y == 0 and self.jx_lz_y == 0:
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            coupling[0, 0] = c
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 2: ix_lz_y != 0 and jx_lz_y == 0 (Pi to Sigma)
-        elif self.ix_lz_y != 0 and self.jx_lz_y == 0:
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            if self.parity_j == -1:
-                coupling[0, 0] = c
-                coupling[1, 0] = -c * np.conj(a[0, 1] / a[1, 1])
-            else:
-                coupling[1, 0] = c
-                coupling[0, 0] = -c * np.conj(a[1, 1] / a[0, 1])
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 3: ix_lz_y == 0 and jx_lz_y != 0 (Sigma to Pi)
-        elif self.ix_lz_y == 0 and self.jx_lz_y != 0:
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            if self.parity_i == -1:
-                coupling[0, 0] = c
-                coupling[0, 1] = -c * b[0, 1] / b[1, 1]
-            else:
-                coupling[0, 1] = c
-                coupling[0, 0] = -c * b[1, 1] / b[0, 1]
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 4: Both non-zero with different absolute values (Pi-Pi different Lambda)
-        elif abs(self.ix_lz_y) != abs(self.jx_lz_y):
-            # L+ coupling between different Pi states
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            coupling[0, 0] = -c * b[1, 1] / b[0, 1]
-            coupling[0, 1] = c
-            coupling[1, 0] = c * np.conj(a[0, 1] / a[1, 1]) * b[1, 1] / b[0, 1]
-            coupling[1, 1] = -c * np.conj(a[0, 1] / a[1, 1])
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
-
-        # Case 5: Same absolute values (diagonal case)
-        else:
-            coupling = np.zeros((2, 2), dtype=np.complex128)
-            coupling[0, 1] = c
-            coupling[1, 0] = -np.conj(a[0, 0]) * c * b[1, 1] / (np.conj(a[1, 0]) * b[0, 1])
-            f_t = np.conj(a.T) @ coupling @ b
-            return f_t[0, 0].real
+        if self.field_type == FieldType.LXLY:
+            return values * self.molpro_duo_factor('L+')
+        return values
 
     def _polynomial(self, r, params, xp):
         """Polynomial expansion using Horner's method (GPU-efficient)."""

@@ -33,6 +33,8 @@ class JobConfig:
     shift_to_zpe: bool = True
     intensity: bool = False
     fitting: bool = False
+    # Duo diatom.f90:302 (default .true.) / keywords at 703-709
+    assign_v_by_count: bool = True
 
 
 @dataclass
@@ -126,6 +128,12 @@ class InputParser:
         self._parse_atoms(content)
         self._parse_grid(content)
         self._parse_jrot(content)
+        # Global v-assignment mode keywords (Duo diatom.f90:703-709);
+        # default is ASSIGN_V_BY_COUNT (diatom.f90:302)
+        if re.search(r'(?i)\bassign_v_by_contribution\b', content):
+            self.job.assign_v_by_count = False
+        elif re.search(r'(?i)\bassign_v_by_count\b', content):
+            self.job.assign_v_by_count = True
         self._parse_abinitio(content)  # Parse ab initio data first
         self._parse_poten(content)
         self._parse_spinorbit(content)
@@ -605,7 +613,7 @@ class InputParser:
         """Parse various coupling sections."""
         coupling_types = [
             ('L2', FieldType.L2),
-            ('L\+', FieldType.LXLY),
+            (r'L\+', FieldType.LXLY),
             ('Lx', FieldType.LXLY),  # Lx is same as L+ (L-uncoupling)
             ('LXLY', FieldType.LXLY),
             ('SPIN-SPIN', FieldType.SPINSPIN),
@@ -649,6 +657,51 @@ class InputParser:
     def _parse_single_coupling(self, istate: int, jstate: int, field_type: FieldType,
                                name: str, content: str):
         """Parse a single coupling section."""
+        # Quantum numbers (lambda i j / sigma i j / spin i j lines), exactly as
+        # in _parse_single_spinorbit. Duo couplings declare these per section;
+        # fall back to the electronic-state values when a line is absent.
+        # Without this, every coupling kept the dataclass defaults
+        # lambda_i = lambda_j = 0 and the batched L+ selection rule
+        # (hamiltonian.py lambda_match) never matched a real |dLambda|=1
+        # coupling -- Lx fields were silently dropped.  [audit H2]
+        lambda_i = None
+        lambda_j = None
+        match = re.search(r'(?i)lambda\s+([\d+-]+)\s+([\d+-]+)', content)
+        if match:
+            lambda_i = int(match.group(1))
+            lambda_j = int(match.group(2))
+
+        sigma_i = 0.0
+        sigma_j = 0.0
+        match = re.search(r'(?i)sigma\s+([\d.+-]+)\s+([\d.+-]+)', content)
+        if match:
+            sigma_i = float(match.group(1))
+            sigma_j = float(match.group(2))
+
+        spin_i = None
+        spin_j = None
+        match = re.search(r'(?i)spin\s+([\d.+-]+)\s+([\d.+-]+)', content)
+        if match:
+            spin_i = float(match.group(1))
+            spin_j = float(match.group(2))
+
+        # Fall back to the electronic states' lambda/spin when not declared
+        for s in self.states:
+            if s.istate == istate:
+                if lambda_i is None:
+                    lambda_i = s.lambda_
+                if spin_i is None:
+                    spin_i = s.spin
+            if s.istate == jstate:
+                if lambda_j is None:
+                    lambda_j = s.lambda_
+                if spin_j is None:
+                    spin_j = s.spin
+        lambda_i = 0 if lambda_i is None else lambda_i
+        lambda_j = 0 if lambda_j is None else lambda_j
+        spin_i = 0.0 if spin_i is None else spin_i
+        spin_j = 0.0 if spin_j is None else spin_j
+
         func_type = "GRID"
         match = re.search(r'(?i)type\s+(\S+)', content)
         if match:
@@ -691,9 +744,23 @@ class InputParser:
             field_type=field_type,
             istate=istate,
             jstate=jstate,
+            lambda_i=lambda_i,
+            lambda_j=lambda_j,
+            sigma_i=sigma_i,
+            sigma_j=sigma_j,
+            spin_i=spin_i,
+            spin_j=spin_j,
             func_type=func_type,
             parameters=np.array(values) if values else None
         )
+        # An LXLY/L+ coupling must connect |dLambda| = 1 states; a mis-parsed
+        # section would otherwise silently generate no (or fake) couplings.
+        if field_type == FieldType.LXLY and abs(lambda_i - lambda_j) != 1:
+            import warnings
+            warnings.warn(
+                f"LXLY coupling {istate}-{jstate}: |lambda_i - lambda_j| != 1 "
+                f"(got {lambda_i}, {lambda_j}) -- check the 'lambda i j' line "
+                f"in the input section")
         coupling.morphing = morphing
         coupling.factor = factor
         coupling.complex_f = complex_f

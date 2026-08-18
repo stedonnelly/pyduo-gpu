@@ -64,6 +64,10 @@ class PhysicalConstants:
         print(f"{'1 kJ/mol':40s} = {cls.KJOULE:20.10f} cm^-1")
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=4096)
 def faclog(a: float) -> float:
     """
     Calculate log(a!) for non-negative integer a.
@@ -87,6 +91,9 @@ def faclog(a: float) -> float:
     return v
 
 
+# [phase P] The solver evaluates three_j inside per-basis-pair loops --
+# >100k calls that collapse to a handful of distinct argument tuples.
+@lru_cache(maxsize=65536)
 def three_j(a: float, b: float, c: float, al: float, be: float, ga: float) -> float:
     """
     Calculate the Wigner 3j symbol.

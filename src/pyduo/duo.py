@@ -1,4 +1,4 @@
-"""
+﻿"""
 Main PyDuo solver class
 
 This is the main entry point for PyDuo calculations.
@@ -37,6 +37,12 @@ class EnergyLevel:
     omega: float            # Omega = Lambda + Sigma
     spin: float = 0.5       # Spin quantum number S
     name: str = ""          # State name
+    purity: float = 1.0     # c^2 of the assigned basis label (confidence)
+    assign_flags: tuple = ()  # LOW_PURITY / AMBIGUOUS / GAVE_UP_DUPLICATE / ...
+    band_id: int = -1       # cross-J diabatic band (additive metadata)
+    band_overlap: float = 0.0
+    v_nodes: Optional[int] = None  # nodal count of the channel function
+    block_iroot: int = -1   # root index within its (J, parity) block
 
 
 class DuoSolver:
@@ -214,6 +220,19 @@ class DuoSolver:
             for coupling in self.parser.couplings:
                 self.hamiltonian.add_coupling(coupling)
 
+        # Quantum-number assignment configuration from the input
+        # (ASSIGN_V_BY_COUNT is Duo's default; the reference outputs were
+        # produced in count mode)
+        if self.parser:
+            from pyduo.assignment import AssignmentConfig
+            self.hamiltonian.assign_cfg = AssignmentConfig(
+                method=getattr(self, 'assign_method', 'greedy_duo'),
+                v_mode='count' if self.parser.job.assign_v_by_count
+                       else 'contribution',
+                node_check=getattr(self, 'node_check', 'flagged'))
+            # [phase F] Hellmann-Feynman gradient support
+            self.hamiltonian.capture_blocks = getattr(self, 'capture_blocks', False)
+
         # Solve vibrational problem
         self._solve_vibrational()
 
@@ -282,7 +301,13 @@ class DuoSolver:
                 sigma=es.sigma,
                 omega=es.omega,
                 spin=es.spin,
-                name=es.name
+                name=es.name,
+                purity=getattr(es, 'purity', 1.0),
+                assign_flags=tuple(getattr(es, 'assign_flags', ())),
+                band_id=getattr(es, 'band_id', -1),
+                band_overlap=getattr(es, 'band_overlap', 0.0),
+                v_nodes=getattr(es, 'v_nodes', None),
+                block_iroot=getattr(es, 'block_iroot', -1)
             )
             self.energy_levels.append(level)
 
@@ -387,7 +412,13 @@ class DuoSolver:
                 sigma=es.sigma,
                 omega=es.omega,
                 spin=es.spin,
-                name=es.name
+                name=es.name,
+                purity=getattr(es, 'purity', 1.0),
+                assign_flags=tuple(getattr(es, 'assign_flags', ())),
+                band_id=getattr(es, 'band_id', -1),
+                band_overlap=getattr(es, 'band_overlap', 0.0),
+                v_nodes=getattr(es, 'v_nodes', None),
+                block_iroot=getattr(es, 'block_iroot', -1)
             )
             self.energy_levels.append(level)
 
@@ -403,72 +434,6 @@ class DuoSolver:
             for i, es in enumerate(eigenstates[:10]):
                 print(f"      {i}: {es.energy:.4f} (rel: {es.energy-zpe:.4f}) {es.parity} lambda={es.lambda_} sigma={es.sigma}")
 
-    def _assign_quantum_numbers(self, J: float, eigenvalues: np.ndarray,
-                                eigenvectors: np.ndarray):
-        """Assign quantum numbers to computed energy levels."""
-        # Use active_basis_indices for the filtered basis used in diagonalization
-        if hasattr(self.hamiltonian, 'active_basis_indices'):
-            active_indices = self.hamiltonian.active_basis_indices
-            nbasis = len(active_indices)
-        else:
-            active_indices = list(range(len(self.hamiltonian.contracted_basis)))
-            nbasis = len(self.hamiltonian.contracted_basis)
-
-        for i, energy in enumerate(eigenvalues):
-            # Find dominant basis state from eigenvector
-            if eigenvectors is not None and i < eigenvectors.shape[1]:
-                coefs = eigenvectors[:, i]
-
-                # The eigenvector dimension should match the active (filtered) basis
-                if len(coefs) == nbasis:
-                    idx_max = np.argmax(np.abs(coefs))
-                    # Map back to the full contracted_basis using active_indices
-                    basis = self.hamiltonian.contracted_basis[active_indices[idx_max]]
-
-                    # Determine parity from sigma sign
-                    parity = 1 if basis.sigma >= 0 else -1
-
-                    level = EnergyLevel(
-                        energy=energy,
-                        J=J,
-                        parity=parity,
-                        state=basis.istate,
-                        v=basis.v,
-                        lambda_=basis.lambda_,
-                        sigma=basis.sigma,
-                        omega=basis.omega,
-                        spin=basis.spin,
-                        name=basis.name
-                    )
-                    self.energy_levels.append(level)
-                else:
-                    # Eigenvector dimension mismatch - assign based on energy ordering
-                    # For a single state, v increases with energy
-                    v_approx = i // 2  # Two spin components per v
-                    sigma = 0.5 if (i % 2 == 0) else -0.5
-                    if self.states:
-                        state = self.states[0]
-                        level = EnergyLevel(
-                            energy=energy,
-                            J=J,
-                            parity=1 if sigma >= 0 else -1,
-                            state=0,
-                            v=v_approx,
-                            lambda_=state.lambda_,
-                            sigma=sigma,
-                            omega=state.lambda_ + sigma,
-                            spin=state.spin,
-                            name=state.name
-                        )
-                    else:
-                        level = EnergyLevel(energy=energy, J=J, parity=1,
-                                           state=0, v=v_approx, lambda_=0,
-                                           sigma=sigma, omega=sigma, spin=0.5)
-                    self.energy_levels.append(level)
-            else:
-                self.energy_levels.append(EnergyLevel(energy=energy, J=J, parity=1,
-                                                      state=0, v=0, lambda_=0,
-                                                      sigma=0, omega=0, spin=0.5))
 
     def get_energies(self, J: Optional[float] = None,
                      relative: bool = True) -> np.ndarray:
