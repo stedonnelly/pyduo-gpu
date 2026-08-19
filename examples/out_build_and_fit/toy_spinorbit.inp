@@ -1,0 +1,162 @@
+! toy CaO-like 2-state model [toy_spinorbit]
+
+masses 39.96259060000 15.99491463000
+nstates 3
+jrot 0.0 - 5.0
+
+grid
+  npoints  301
+  range  1.200000, 3.500000
+  type 0
+  re 1.820000
+end
+
+CONTRACTION
+  vib
+  vmax 20
+END
+
+poten 1
+name "X1Sigma+"
+symmetry +
+lambda 0
+mult   1
+type   EMO
+values
+V0            0.00000000000E+00
+RE            1.82217064420E+00
+DE            4.83594515000E+04
+RREF         -1.00000000000E+00
+PL            4.00000000000E+00
+PR            4.00000000000E+00
+NL            2.00000000000E+00
+NR            3.00000000000E+00
+B0            1.37032848858E+00  fit
+B1           -1.86906397450E-01  fit
+B2           -2.99618181030E-01  fit
+B3           -5.03923266600E-02  fit
+end
+
+poten 2
+name "A1Pi"
+lambda 1
+mult   1
+type   EMO
+values
+V0            8.69050515980E+03
+RE            2.07433677570E+00
+DE            4.83594515000E+04
+RREF         -1.00000000000E+00
+PL            4.00000000000E+00
+PR            4.00000000000E+00
+NL            2.00000000000E+00
+NR            3.00000000000E+00
+B0            1.13075086866E+00  fit
+B1           -1.66777939260E-01  fit
+B2           -1.66516080600E-02  fit
+B3           -7.87818445600E-02  fit
+end
+
+poten 3
+name "a3Pi"
+lambda 1
+mult   3
+type   EMO
+values
+V0            8.38042427810E+03
+RE            2.07583703480E+00
+DE            3.31493885000E+04
+RREF         -1.00000000000E+00
+PL            4.00000000000E+00
+PR            4.00000000000E+00
+NL            2.00000000000E+00
+NR            3.00000000000E+00
+B0            1.43075719712E+00  fit
+B1           -3.71769146100E-02  fit
+B2           -2.14736985190E-01  fit
+B3            9.90223307470E-01  fit
+end
+
+Lx 1 2
+name "Lx_1_2"
+lambda 0 1
+spin   0.0 0.0
+sigma  0.0 0.0
+factor i
+<x|Lz|y> 0 i
+type  BOBLEROY
+morphing
+values
+RE            1.80000000000E+00
+RREF         -1.00000000000E+00
+P             2.00000000000E+00
+NT            2.00000000000E+00
+B0           -1.05520806420E+00  fit
+B1            0.00000000000E+00
+B2            0.00000000000E+00
+BINF          1.00000000000E+00
+end
+
+spin-orbit-x 1 3
+name "spin-orbit-x_1_3"
+lambda 0 1
+spin   0.0 1.0
+sigma  0.0 1.0
+factor i
+<x|Lz|y> 0 i
+type  BOBLEROY
+morphing
+values
+RE            1.80000000000E+00
+RREF         -1.00000000000E+00
+P             2.00000000000E+00
+NT            1.00000000000E+00
+B0            6.77922150100E-01  fit
+B1            0.00000000000E+00
+BINF          1.00000000000E+00
+end
+
+abinitio Lx 1 2
+name "abinitio Lx_1_2"
+lambda 0 1
+spin   0.0 0.0
+sigma  0.0 0.0
+type   grid
+factor i
+<x|Lz|y> 0 i
+units angstrom cm-1
+N 9
+values
+      1.30000000         0.6983968942
+      1.53750000         0.7627762647
+      1.77500000         0.8822685595
+      2.01250000         1.0435235506
+      2.25000000         1.1879673484
+      2.48750000         1.2769681438
+      2.72500000         1.3198249215
+      2.96250000         1.3380131767
+      3.20000000         1.3453150044
+end
+
+abinitio spin-orbit-x 1 3
+name "abinitio spin-orbit-x_1_3"
+lambda 0 1
+spin   0.0 1.0
+sigma  0.0 1.0
+type   grid
+factor i
+<x|Lz|y> 0 i
+units angstrom cm-1
+N 9
+values
+      1.30000000        47.7475866746
+      1.53750000        49.8145649484
+      1.77500000        52.3446583852
+      2.01250000        55.1499921880
+      2.25000000        57.9390239488
+      2.48750000        60.4267595503
+      2.72500000        62.4399624156
+      2.96250000        63.9446790862
+      3.20000000        65.0038552841
+end
+

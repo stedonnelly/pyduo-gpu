@@ -1,0 +1,8 @@
+cost=3.83528e-16  nfev=5  status=3
+condition number (scaled J): 1.26
+parameter                   value      1-sigma       rel
+poten1:B0               1.3703285     4.45e-13   3.2e-13
+poten2:B0               1.1307509     3.36e-13     3e-13
+sloppiest directions (data-undetermined combos):
+  sv/sv_max=7.94e-01: -0.71*poten2:B0 -0.71*poten1:B0
+  sv/sv_max=1.00e+00: -0.71*poten1:B0 +0.71*poten2:B0

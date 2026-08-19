@@ -1,6 +1,9 @@
 # Dev spefcific ignores
 .vscode/
 working_folder/
+tracking/
+attic/
+tools/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
