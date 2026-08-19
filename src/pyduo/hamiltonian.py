@@ -390,6 +390,11 @@ class HamiltonianBuilder:
             nmax = max(1, nmax)  # At least one state
             vib_solutions[state.istate] = (eigenvalues, eigenvectors, nmax)
 
+        # retain per-state solutions: consumers (duo.py diagnostics, the
+        # population solver's frozen-span mode) reuse them instead of
+        # re-diagonalizing 501x501 per state  [phase 2]
+        self._vib_solutions = vib_solutions
+
         # Build "quanta" list: (istate, tau, sigma) like Duo's ilevel ordering
         # This is Duo's sigma-lambda basis set ordering
         quanta_list = []
@@ -758,6 +763,21 @@ class HamiltonianBuilder:
         """
         if not self.use_gpu:
             raise ValueError("Batched solver requires GPU. Initialize with use_gpu=True")
+
+        # [phase 2] structure-factor path: assemble each (J, parity) block
+        # directly at symmetrised size (no (nJ, N, N) tensor, no per-pair
+        # Python loops). Bit-identical labels/energies gated by
+        # tools/gate_sf.py; legacy path retained as reference + for the
+        # reduced-basis probes (which set use_structure_factors=False).
+        if (getattr(self, 'use_structure_factors', True)
+                and not getattr(self, '_assembly_only', False)):
+            from pyduo.assembly import SFUnsupported
+            try:
+                return self._solve_all_J_sf(j_list)
+            except SFUnsupported as e:
+                import warnings
+                warnings.warn(f'structure-factor path unavailable ({e}); '
+                              f'using legacy assembly')
 
         xp = cp
         nJ = len(j_list)
@@ -1760,11 +1780,14 @@ class HamiltonianBuilder:
                     all_eigenstates.append(eigenstate)
 
                 # [phase F] capture block data for Hellmann-Feynman gradients
+                # (isym_to_basis added for the structure-factor probe, which
+                # reads the parity pairing off a reduced-basis run)
                 if getattr(self, 'capture_blocks', False):
                     self._last_blocks.append({
                         'J': J, 'parity': parity_char, 'jidx': jidx,
                         'P': P, 'V': eigenvectors_np,
-                        'valid_indices': list(valid_indices)})
+                        'valid_indices': list(valid_indices),
+                        'isym_to_basis': list(isym_to_basis)})
 
                 # [phase 4] collect primitive coefficients scattered into the
                 # fixed GLOBAL basis index space for cross-J band tracking
@@ -1787,6 +1810,114 @@ class HamiltonianBuilder:
         # Sort by (J, energy)
         all_eigenstates.sort(key=lambda x: (x.J, x.energy))
 
+        return all_eigenstates
+
+    def _solve_all_J_sf(self, j_list: List[float]) -> List[EigenState]:
+        """Structure-factor solve: per-(J, parity) assembly at symmetrised
+        block size via measured C_t(J) factors (pyduo/assembly.py), then the
+        SAME diagonalization / canonicalization / assignment / band-tracking
+        pipeline as the legacy path. Never materialises the (nJ, Nmax, Nmax)
+        tensor. Gated bit-exact against legacy by tools/gate_sf.py."""
+        xp = cp
+        from pyduo.assembly import get_structure_factors
+        from pyduo.assignment import (assign_block, canonicalize_degenerate,
+                                      nodal_v_check)
+
+        self._warn_unconsumed_fields()
+        j_list = [float(j) for j in j_list]
+        max_J = max(j_list)
+        max_basis_indices = [i for i, s in enumerate(self.contracted_basis)
+                             if abs(s.omega) <= max_J + 0.01]
+        if not max_basis_indices:
+            return []
+        self._precompute_batched_gpu_data(j_list, max_basis_indices)
+        sf = get_structure_factors(self, j_list, verbose=self.verbose >= 2)
+        self._sf = sf
+        ms = sf.gather_ms(self)
+        sc = self._sc
+        Nmax = len(max_basis_indices)
+        active_pos = {full: k for k, full in enumerate(max_basis_indices)}
+        active_basis = [self.contracted_basis[i] for i in max_basis_indices]
+
+        all_eigenstates = []
+        band_blocks = []
+        if getattr(self, 'capture_blocks', False):
+            self._last_blocks = []
+
+        for jidx, J in enumerate(j_list):
+            for parity_char in ('+', '-'):
+                key = (J, parity_char)
+                bs = sf.blocks.get(key)
+                if bs is None or bs.n == 0:
+                    continue
+
+                hs = sf.assemble(key, ms, self._energies_gpu, sc)
+                w_gpu, v_gpu = xp.linalg.eigh(hs)
+                eigenvalues_np = cp.asnumpy(w_gpu) / sc
+                eigenvectors_np = cp.asnumpy(v_gpu)
+
+                valid_idx_act = [active_pos[int(f)] for f in bs.valid_indices]
+                valid_basis = [active_basis[i] for i in valid_idx_act]
+
+                if self.assign_cfg.canonicalize:
+                    eigenvectors_np = canonicalize_degenerate(
+                        eigenvalues_np, eigenvectors_np)
+                isym_to_basis = [int(i) for i in bs.isym_to_basis]
+                labels = assign_block(eigenvalues_np, eigenvectors_np,
+                                      isym_to_basis, valid_basis,
+                                      self.assign_cfg)
+
+                prim_coeffs = sf.project_to_primitive(key, eigenvectors_np)
+                if self.assign_cfg.node_check != 'off':
+                    nodal_v_check(labels, prim_coeffs, valid_basis,
+                                  self.contracted_wavefunctions,
+                                  self.assign_cfg)
+
+                block_state_refs = []
+                for lab in labels:
+                    basis_state = valid_basis[lab.ibasis]
+                    eigenstate = EigenState(
+                        energy=eigenvalues_np[lab.iroot],
+                        J=J,
+                        istate=basis_state.istate,
+                        v=lab.v,
+                        lambda_=basis_state.lambda_,
+                        sigma=basis_state.sigma,
+                        omega=basis_state.omega,
+                        spin=basis_state.spin,
+                        parity=parity_char,
+                        name=basis_state.name,
+                        coefficients=eigenvectors_np[:, lab.iroot]
+                    )
+                    eigenstate.purity = lab.purity
+                    eigenstate.assign_flags = lab.flags
+                    eigenstate.v_nodes = lab.v_nodes
+                    eigenstate.block_iroot = lab.iroot
+                    block_state_refs.append(eigenstate)
+                    all_eigenstates.append(eigenstate)
+
+                if getattr(self, 'capture_blocks', False):
+                    self._last_blocks.append({
+                        'J': J, 'parity': parity_char, 'jidx': jidx,
+                        'P': sf.build_P(key), 'V': eigenvectors_np,
+                        'valid_indices': valid_idx_act,
+                        'isym_to_basis': isym_to_basis})
+
+                if self.track_bands:
+                    Cg = np.zeros((Nmax, prim_coeffs.shape[1]))
+                    Cg[valid_idx_act, :] = prim_coeffs
+                    band_blocks.append({'J': J, 'parity': parity_char,
+                                        'global_coeffs': Cg,
+                                        'states': block_state_refs})
+
+        if self.track_bands and band_blocks:
+            from pyduo.assignment import track_bands
+            n_bands = track_bands(band_blocks)
+            if self.verbose >= 3:
+                print(f"  band tracking: {n_bands} bands across "
+                      f"{len(band_blocks)} blocks")
+
+        all_eigenstates.sort(key=lambda x: (x.J, x.energy))
         return all_eigenstates
 
     def _precompute_batched_gpu_data(self, j_list: List[float], max_basis_indices: List[int]):

@@ -216,23 +216,41 @@ _FIT_LINE_RE = re.compile(
 class FittingProblem:
     """Owns the observations, the fit-parameter registry and the objective."""
 
-    def __init__(self, input_file: str, solver=None, verbose: int = 1):
+    def __init__(self, input_file: str, solver=None, verbose: int = 1,
+                 observations=None):
+        """observations : optional list of Observation to use INSTEAD of the
+        input's FITTING block (synthetic data, an external line list, a subset
+        selected in a notebook). When given, the input file is still read --
+        it remains the source of the fit-parameter registry and of
+        model_final.inp -- but it needs no FITTING section at all."""
         self.input_file = input_file
         self.verbose = verbose
         self.solver = solver          # a DuoSolver, already load_input()-ed
         self.obs: List[Observation] = []
         self.params: List[FitParameter] = []
         self.j_filter: Optional[float] = None
+        # finite residual (cm-1) assigned to an in-scope obs that cannot be
+        # matched: keeps the residual vector FIXED LENGTH (scipy's robust-loss
+        # buffers require it) and makes unmatching strictly unprofitable
+        self.unmatched_penalty = 1000.0
         self.n_unmatched = 0
         self.eval_count = 0
         self.history: List[dict] = []
         self.snapshots: List[dict] = []   # reporting data (pyduo.reporting)
+        self.output_dir = None            # set it -> fit() saves output files
         with open(input_file) as f:
             raw = f.read()
         # strip parenthesis comments the way the level parser does not:
         # keep raw for section scanning; obs rows are matched line-wise
         self._raw = raw
-        self._parse_observations(raw)
+        if observations is not None:
+            self.obs = list(observations)
+            if self.verbose:
+                kinds = {o.kind for o in self.obs}
+                print(f'using {len(self.obs)} supplied observations '
+                      f'({"/".join(sorted(kinds))})')
+        else:
+            self._parse_observations(raw)
 
     # ---------------- observations ----------------
     def _parse_observations(self, raw: str) -> None:
@@ -346,6 +364,11 @@ class FittingProblem:
             if fld is None or fld.parameters is None:
                 continue
             for name, val in names:
+                if header[0] == 'poten' and name in ('PL', 'PR', 'NL', 'NR'):
+                    print(f'WARN: {label}:{name} is integer-truncated inside '
+                          f'EMO (objective piecewise-constant in it) -- NOT '
+                          f'registered as a fit parameter')
+                    continue
                 idx = idx_of(name)
                 if idx is None or idx >= len(fld.parameters):
                     continue
@@ -410,7 +433,14 @@ class FittingProblem:
         return s.energy_levels
 
     def match(self, levels) -> np.ndarray:
-        """Match obs to calc by unsigned quantum numbers; returns residuals."""
+        """Match obs to calc by unsigned quantum numbers.
+
+        Returns the FIXED-LENGTH weighted residual vector: one row per
+        in-scope observation, in `self.obs` order. Unmatched rows carry the
+        finite `unmatched_penalty` so (a) the vector length never changes
+        mid-fit (scipy's robust-loss buffers are sized once at x0) and
+        (b) the optimizer is never rewarded for pushing a level out of its
+        assignment."""
         table = {}
         for l in levels:
             key = (l.J, l.parity, l.state, l.v, abs(l.lambda_),
@@ -419,9 +449,11 @@ class FittingProblem:
                 table[key] = l
         res = []
         self.n_unmatched = 0
+        pen = float(self.unmatched_penalty)
         for o in self.obs:
             if not self._obs_in_scope(o):
-                continue
+                o.matched = False      # never leave stale flags on
+                continue               # out-of-scope obs (j_filter changes)
             key = (o.J, o.parity, o.state, o.v, abs(o.lambda_),
                    int(round(2 * abs(o.sigma))), int(round(2 * abs(o.omega))))
             l = table.get(key)
@@ -432,7 +464,9 @@ class FittingProblem:
                 l2 = table.get(key2)
                 if l is None or l2 is None:
                     o.matched = False
+                    o.calc = None
                     self.n_unmatched += 1
+                    res.append(pen * np.sqrt(o.weight))
                     continue
                 o.matched = True
                 o.calc = l.energy - l2.energy          # calc frequency
@@ -443,7 +477,9 @@ class FittingProblem:
                 continue
             if l is None:
                 o.matched = False
+                o.calc = None
                 self.n_unmatched += 1
+                res.append(pen * np.sqrt(o.weight))
                 continue
             o.matched = True
             o.calc = l.energy
@@ -452,13 +488,65 @@ class FittingProblem:
             res.append((o.calc - o.energy) * np.sqrt(o.weight))
         return np.array(res)
 
+    def _validity_violation(self) -> float:
+        """Physical-validity guard for pathological trial parameters.
+
+        Returns 0.0 for a sane model, else a positive magnitude used to slope
+        the penalty surface back toward feasibility, so global samplers can
+        probe freely without crashing the solver:
+        per EMO potential require De > 0, V0 < DE (bound well), RE > 0."""
+        bad = 0.0
+        parser = getattr(self.solver, 'parser', None)
+        for f in (getattr(parser, 'potentials', None) or []):
+            pr = f.parameters
+            if pr is None or len(pr) < 3:
+                continue
+            v0, re_, de = float(pr[0]), float(pr[1]), float(pr[2])
+            if not np.isfinite([v0, re_, de]).all():
+                return 1.0
+            bad += max(0.0, (v0 - de) / 1e3)      # dissociation below minimum
+            bad += max(0.0, -re_) * 10.0
+            bad += max(0.0, -de) / 1e3
+        return bad
+
     def residuals(self, x: Optional[np.ndarray] = None) -> np.ndarray:
         if x is not None:
             for p, xv in zip(self.params, x):
                 p.set(xv)
         t0 = time.time()
-        levels = self._run_solver()
-        r = self.match(levels)
+        n_scope = sum(1 for o in self.obs if self._obs_in_scope(o))
+        if n_scope == 0:
+            raise ValueError('no observations in scope -- check j_filter '
+                             'against the observed J range')
+        bad = self._validity_violation()
+        levels = None
+        if bad == 0.0:
+            try:
+                levels = self._run_solver()
+            except np.linalg.LinAlgError as e:
+                if self.verbose:
+                    print(f'  eval guarded: solver LinAlgError ({e})')
+                bad = 1.0
+            if levels is not None:
+                en = np.array([l.energy for l in levels], dtype=float)
+                if en.size == 0 or not np.isfinite(en).all():
+                    bad = max(bad, 1.0)
+                    levels = None
+        if levels is None:
+            # penalty surface: finite, fixed length, sloped back to validity
+            pen = float(self.unmatched_penalty) * (1.0 + bad)
+            r = np.array([pen * np.sqrt(o.weight) for o in self.obs
+                          if self._obs_in_scope(o)])
+            for o in self.obs:
+                if self._obs_in_scope(o):
+                    o.matched = False
+                    o.calc = None
+            self.n_unmatched = n_scope
+            self._guarded = True
+        else:
+            self._guarded = False
+            self._last_levels = levels
+            r = self.match(levels)
         self.eval_count += 1
         matched = [o for o in self.obs if o.matched]
         rms = float(np.sqrt(np.mean([(o.calc - o.energy) ** 2 for o in matched]))) \
@@ -466,8 +554,15 @@ class FittingProblem:
         wrms = float(np.sqrt(np.mean(r ** 2))) if len(r) else float('nan')
         self.history.append({'eval': self.eval_count, 'rms': rms,
                              'wrms': wrms, 'unmatched': self.n_unmatched,
+                             'guarded': self._guarded,
                              't': time.time() - t0})
-        self._jac_base_key = tuple(p.get() for p in self.params)
+        # guarded evals leave no captured blocks -- never let hf_jacobian
+        # treat them as a valid base point. The key includes the J scope:
+        # the same parameters at a different j_filter are a DIFFERENT base
+        # (different blocks, different residual rows).
+        self._jac_base_key = (None if self._guarded else
+                              (self.j_filter,) +
+                              tuple(p.get() for p in self.params))
 
         # [viz] snapshot for reporting: kept in memory (pyduo.reporting.
         # FitReport / prob.report) and optionally streamed to monitor_path so
@@ -570,30 +665,184 @@ class FittingProblem:
         dM = wf.T @ (dV.reshape(-1, 1) * wf)          # (nvib, nvib)
         return dM, p.field_obj.istate
 
-    def hf_jacobian(self, x: np.ndarray) -> np.ndarray:
-        """Jacobian of the weighted residual vector at x, no eigensolves."""
+    def _dmatelem_for_param(self, hb, sf, p, rel_step=1e-6):
+        """(term_index, dM) for a coupling parameter via central FD on the
+        501-point CURVE only (2 field evaluations -- morphing, MOLPRO factor
+        and all recipe scalings included for free). Replaces the legacy
+        3-full-precomputes-per-parameter path.  [phase 3]"""
         import cupy as cp
+        lname, k = self._field_slot(hb, p.field_obj)
+        if lname is None:
+            return None
+        cname = self._FIELD_TO_CACHE[lname]
+        t_i = sf.term_index(cname, k)
+        if t_i is None:
+            return None
+        x0 = p.get()
+        delta = rel_step * max(1.0, abs(x0))
+        r = hb._r_gpu
+        try:
+            p.set(x0 + delta)
+            p.field_obj._molpro_factor_cache = None
+            fp_ = cp.asarray(p.field_obj.evaluate(r, use_gpu=True))
+            p.set(x0 - delta)
+            p.field_obj._molpro_factor_cache = None
+            fm_ = cp.asarray(p.field_obj.evaluate(r, use_gpu=True))
+        finally:
+            p.set(x0)
+            p.field_obj._molpro_factor_cache = None
+        dcurve = (fp_ - fm_) / (2.0 * delta)
+        # recipe scaling must match _precompute_batched_gpu_data exactly
+        if cname in ('_lx_matelem_cache', '_bobrot_matelem_cache'):
+            dcurve = dcurve * hb._b_rot_r2_gpu * hb._sc
+        wf = hb._wf_gpu
+        dM = wf.T @ (dcurve.reshape(-1, 1) * wf)
+        return t_i, dM
+
+    def _hf_jacobian_sf(self, rows, J_mat, hb, sf) -> np.ndarray:
+        """Structure-factor Jacobian: all parameters in one pass, fully on
+        GPU (no per-parameter assembly of the full tensor, no per-block
+        host round-trips).  [phase 3]"""
+        import cupy as cp
+        blocks = {(b['J'], b['parity']): b for b in hb._last_blocks}
+        nvib = len(hb.contracted_energies)
+        ivib_state = np.zeros(nvib, dtype=np.int64)
+        for bs_ in hb.contracted_basis:
+            ivib_state[bs_.ivib] = bs_.istate
+
+        # ZPE handle (energy mode): residual = (E_i - E_zpe) - obs
+        zentry = None
+        if any(o.kind == 'energy' for o in rows):
+            levels = getattr(self, '_last_levels', None) or []
+            if levels:
+                zl = min(levels, key=lambda l: l.energy)
+                zentry = ((zl.J, '+' if zl.parity > 0 else '-'),
+                          getattr(zl, 'block_iroot', -1))
+
+        # per-block root lists + (jacobian row, root position, sign) entries
+        need = {}
+
+        def _add(k, iroot, jrow, sign):
+            if iroot is None or iroot < 0:
+                return
+            d = need.setdefault(k, {'roots': {}, 'entries': []})
+            pos = d['roots'].setdefault(int(iroot), len(d['roots']))
+            d['entries'].append((jrow, pos, sign))
+
+        for jr, o in enumerate(rows):
+            if not o.matched:
+                continue          # penalty row: zero derivative
+            _add((o.J, '+' if o.parity > 0 else '-'),
+                 getattr(o, '_iroot', -1), jr, 1.0)
+            if o.kind == 'freq':
+                _add((o.J2, '+' if o.parity2 > 0 else '-'),
+                     getattr(o, '_iroot2', -1), jr, -1.0)
+            elif zentry is not None:
+                _add(zentry[0], zentry[1], jr, -1.0)
+
+        # parameter derivative matrices: ONE pass, no full precomputes
+        dpot, dcpl = {}, {}
+        for ip, p in enumerate(self.params):
+            if p.label.startswith('poten'):
+                dM, istate_p = self._dh_for_poten(hb, p)
+                dpot[ip] = (dM, istate_p)
+            else:
+                out = self._dmatelem_for_param(hb, sf, p)
+                if out is not None:
+                    dcpl[ip] = out
+        inv_sc = 1.0 / hb._sc
+        ms_stub = [None] * len(sf.terms)
+
+        for k, dd in need.items():
+            b = blocks.get(k)
+            bs = sf.blocks.get(k)
+            if b is None or bs is None:
+                continue
+            root_list = [None] * len(dd['roots'])
+            for r_, pos in dd['roots'].items():
+                root_list[pos] = r_
+            V = cp.asarray(b['V'])
+            nroots = V.shape[1]
+            valid = np.array([0 <= r_ < nroots for r_ in root_list])
+            Vsel = V[:, [min(max(r_, 0), nroots - 1) for r_ in root_list]]
+            g = cp.asarray(bs.group_of_row)
+            iv = cp.asarray(bs.ivib_of_row)
+            gmask = g[:, None] == g[None, :]
+            st_row = ivib_state[bs.ivib_of_row]
+            dE_cols = np.zeros((len(root_list), len(self.params)))
+
+            # potential params: same-level (= same-group) mask, cm-1 directly
+            for ip, (dM, istate_p) in dpot.items():
+                srow = cp.asarray(st_row == istate_p)
+                if not bool(srow.any()):
+                    continue
+                m = gmask & srow[:, None] & srow[None, :]
+                dH = cp.where(m, dM[iv[:, None], iv[None, :]], 0.0)
+                dE_cols[:, ip] = cp.asnumpy(
+                    cp.einsum('ki,kl,li->i', Vsel, dH, Vsel, optimize=True))
+
+            # coupling params: single-term SF assembly, de-scaled by 1/sc
+            for ip, (t_i, dMc) in dcpl.items():
+                ms_stub[t_i] = dMc
+                dH = sf.assemble(k, ms_stub, hb._energies_gpu, hb._sc,
+                                 term_subset=[t_i], include_vib=False)
+                ms_stub[t_i] = None
+                dE_cols[:, ip] = cp.asnumpy(
+                    cp.einsum('ki,kl,li->i', Vsel, dH, Vsel,
+                              optimize=True)) * inv_sc
+
+            dE_cols[~valid, :] = 0.0
+            for (jrow, pos, sign) in dd['entries']:
+                J_mat[jrow, :] += sign * dE_cols[pos, :]
+
+        w = np.sqrt(np.array([o.weight for o in rows], dtype=float))
+        J_mat *= w[:, None]
+        return J_mat
+
+    def hf_jacobian(self, x: np.ndarray) -> np.ndarray:
+        """Jacobian of the weighted residual vector at x, no eigensolves.
+        Uses the structure-factor one-pass path when available (default);
+        falls back to the legacy doctored-cache path otherwise."""
         for p, xv in zip(self.params, x):
             p.set(xv)
-        # base solve at x (captures blocks + level map); reuse if x unchanged
-        key = tuple(float(v) for v in x)
+        # base solve at x (captures blocks + level map); reuse if x AND the
+        # J scope are unchanged
+        key = (self.j_filter,) + tuple(float(v) for v in x)
         if getattr(self, '_jac_base_key', None) != key:
             self.residuals()      # runs solver with capture_blocks
-            self._jac_base_key = key
+
+        # row order = the FIXED-LENGTH residual vector: every in-scope obs
+        rows = [o for o in self.obs if self._obs_in_scope(o)]
+        nres = len(rows)
+        J_mat = np.zeros((nres, len(self.params)))
+        if getattr(self, '_guarded', False):
+            return J_mat          # penalty surface: no useful HF derivative
+
+        hb = self.solver.hamiltonian
+        sf = getattr(hb, '_sf', None)
+        if sf is not None:
+            return self._hf_jacobian_sf(rows, J_mat, hb, sf)
+        return self._hf_jacobian_legacy(rows, J_mat)
+
+    def _hf_jacobian_legacy(self, rows, J_mat) -> np.ndarray:
+        """Legacy per-parameter Jacobian (doctored caches + full assembly
+        per coupling parameter). Reference implementation; used only when
+        the structure-factor path is unavailable."""
+        import cupy as cp
         hb = self.solver.hamiltonian
         blocks = hb._last_blocks
         j_list = self._last_jlist
 
-        # map matched obs -> (J, parity_char, iroot) row order of residuals
-        rows = []
-        for o in self.obs:
-            if not self._obs_in_scope(o):
-                continue
-            if o.matched:
-                rows.append(o)
-
-        nres = len(rows)
-        J_mat = np.zeros((nres, len(self.params)))
+        # [ZPE correction] energy-mode residuals are referenced to
+        # zpe = min(E), so each row needs dE_i/dp - dE_zpe/dp. Freq mode
+        # cancels the ZPE exactly in E_up - E_low, so no correction there.
+        zloc = None
+        if any(o.kind == 'energy' for o in rows):
+            levels = getattr(self, '_last_levels', None) or []
+            if levels:
+                zl = min(levels, key=lambda l: l.energy)
+                zloc = ((zl.J, '+' if zl.parity > 0 else '-'),
+                        getattr(zl, 'block_iroot', -1))
 
         for ip, p in enumerate(self.params):
             if p.label.startswith('poten'):
@@ -661,7 +910,15 @@ class FittingProblem:
                     dE[(b['J'], b['parity'])] = np.einsum(
                         'ki,kl,li->i', V, Hs, V, optimize=True)
 
+            dzpe = 0.0
+            if zloc is not None:
+                dz = dE.get(zloc[0])
+                if dz is not None and 0 <= zloc[1] < len(dz):
+                    dzpe = float(dz[zloc[1]])
+
             for ir, o in enumerate(rows):
+                if not o.matched:
+                    continue          # penalty row: constant, zero derivative
                 d = dE.get((o.J, '+' if o.parity > 0 else '-'))
                 val = d[o._iroot] if (d is not None and
                                       0 <= o._iroot < len(d)) else 0.0
@@ -670,8 +927,39 @@ class FittingProblem:
                     val2 = d2[o._iroot2] if (d2 is not None and
                                              0 <= o._iroot2 < len(d2)) else 0.0
                     val = val - val2       # d(freq)/dp = dE_up/dp - dE_low/dp
+                else:
+                    val = val - dzpe       # ZPE-referenced energy residual
                 J_mat[ir, ip] = val * np.sqrt(o.weight)
         return J_mat
+
+    # ---------------- output files ----------------
+    def save_outputs(self, dirpath: Optional[str] = None,
+                     fit_result=None) -> List[str]:
+        """Write the Duo-like output set (pyduo.output) into `dirpath`
+        (default self.output_dir): energies.dat, curves.csv, obs_calc.csv,
+        model_final.inp, plus fit_stats.txt when a FitResult is supplied.
+        Returns the list of paths written."""
+        import os
+        from pyduo import output as _out
+        d = dirpath or self.output_dir
+        if not d:
+            raise ValueError('no output directory (set prob.output_dir or '
+                             'pass dirpath)')
+        os.makedirs(d, exist_ok=True)
+        levels = getattr(self, '_last_levels', None)
+        if not levels:
+            levels = getattr(self.solver, 'energy_levels', None) or []
+        paths = [_out.write_energies(levels, os.path.join(d, 'energies.dat')),
+                 _out.write_curves(self.solver, os.path.join(d, 'curves.csv')),
+                 _out.write_obs_calc(self, os.path.join(d, 'obs_calc.csv')),
+                 _out.write_model_input(self, os.path.join(d, 'model_final.inp'))]
+        if fit_result is not None:
+            paths.append(_out.write_fit_stats(
+                fit_result, os.path.join(d, 'fit_stats.txt')))
+        if self.verbose:
+            print(f'outputs written to {d}: '
+                  f'{", ".join(os.path.basename(p) for p in paths)}')
+        return paths
 
     # ---------------- reporting ----------------
     @property
@@ -680,16 +968,48 @@ class FittingProblem:
         from pyduo.reporting import FitReport
         return FitReport.from_problem(self)
 
+    # ---------------- cold-start driver ----------------
+    def fit_coldstart(self, **kwargs):
+        """Staged-release x J-curriculum schedule for far-from-solution
+        starts (pyduo.optimizers.fit_coldstart). See default_stages()."""
+        from pyduo.optimizers import fit_coldstart
+        return fit_coldstart(self, **kwargs)
+
+    def multistart(self, **kwargs):
+        """Sobol multistart driver (pyduo.optimizers.multistart_fit)."""
+        from pyduo.optimizers import multistart_fit
+        return multistart_fit(self, **kwargs)
+
+    def population_solver(self, **kwargs):
+        """GPU population-batched objective (pyduo.population.
+        PopulationSolver): evaluates B parameter vectors per batched solve
+        (~20 ms/member at J<=10 with eig='batch'). Requires a valid
+        residuals() at the centre first; re-centre with pop.set_center()."""
+        from pyduo.population import PopulationSolver
+        return PopulationSolver(self, **kwargs)
+
     # ---------------- driver ----------------
-    def fit(self, loss: str = 'soft_l1', f_scale: float = 1.0,
+    def fit(self, loss: str = 'soft_l1', f_scale=1.0,
             max_nfev: Optional[int] = None, diff_step: float = 1e-4,
             select: Optional[List[str]] = None, use_hf_jac: bool = False,
-            bounds: Optional[dict] = None) -> 'FitResult':
-        """Trust-region least squares over the registered fit parameters.
+            bounds: Optional[dict] = None, refresh: bool = True,
+            method: str = 'trf') -> 'FitResult':
+        """Least squares over the registered fit parameters.
 
+        method : 'trf' (scipy trust-region reflective) or 'geodesic'
+            (pyduo.optimizers.geodesic_lm -- LM with geodesic acceleration,
+            step rejection and delayed-gratification damping; the sloppy-
+            model / cold-start workhorse; implies the HF Jacobian).
+        f_scale : robust-loss scale, or 'auto' to set it from the CURRENT
+            robust residual scale (1.4826 * MAD) -- essential far from the
+            solution, where f_scale=1 would down-weight exactly the large
+            residuals that carry the information.
         bounds : optional {label_substring: (lo, hi)} -- physical constraints
             (e.g. keep RE positive, cap a coupling strength). Unlisted
             parameters are unbounded.
+        refresh : re-evaluate residuals at the SOLUTION before returning so
+            obs.calc / snapshots / warm-start state describe the fitted
+            model, not the optimizer's last trial point (costs one eval).
         Returns a FitResult (uncertainties / correlation / conditioning).
         """
         from scipy.optimize import least_squares
@@ -708,21 +1028,52 @@ class FittingProblem:
                     if key in p.label:
                         lo[k], hi[k] = a, b
             x0 = np.clip(x0, lo, hi)
-        if self.verbose:
-            print(f'fitting {len(params)} parameters, loss={loss}, '
-                  f'jac={"hellmann-feynman" if use_hf_jac else "2-point FD"}'
-                  f'{", bounded" if bounds else ""}')
         try:
-            kwargs = dict(method='trf', loss=loss, f_scale=f_scale,
-                          x_scale='jac', max_nfev=max_nfev,
-                          bounds=(lo, hi))
-            if use_hf_jac:
-                kwargs['jac'] = self.hf_jacobian
+            if f_scale == 'auto':
+                r0 = self.residuals()
+                f_scale = float(max(1e-6, 1.4826 * np.median(np.abs(r0))))
+                if self.verbose:
+                    print(f"f_scale='auto' -> {f_scale:.4g}")
+            if self.verbose:
+                print(f'fitting {len(params)} parameters, method={method}, '
+                      f'loss={loss}, '
+                      f'jac={"hellmann-feynman" if use_hf_jac or method == "geodesic" else "2-point FD"}'
+                      f'{", bounded" if bounds else ""}')
+            if method == 'geodesic':
+                from pyduo.optimizers import geodesic_lm
+                result = geodesic_lm(self.residuals, self.hf_jacobian, x0,
+                                     bounds=(lo, hi), loss=loss,
+                                     f_scale=f_scale, max_nfev=max_nfev,
+                                     verbose=max(0, self.verbose - 1))
             else:
-                kwargs['diff_step'] = diff_step
-            result = least_squares(self.residuals, x0, **kwargs)
-        finally:
+                kwargs = dict(method='trf', loss=loss, f_scale=f_scale,
+                              x_scale='jac', max_nfev=max_nfev,
+                              bounds=(lo, hi))
+                if use_hf_jac:
+                    kwargs['jac'] = self.hf_jacobian
+                else:
+                    kwargs['diff_step'] = diff_step
+                result = least_squares(self.residuals, x0, **kwargs)
+        except Exception:
+            # leave the model at the STARTING point, not a failed trial x
+            for p, xv in zip(params, x0):
+                p.set(xv)
             self.params = saved_all
+            raise
+        self.params = saved_all
         for p, xv in zip(params, result.x):
             p.set(xv)
-        return FitResult(result, params)
+        if refresh:
+            self.params = params
+            try:
+                self.residuals()
+            finally:
+                self.params = saved_all
+        fit_result = FitResult(result, params)
+        # output files are part of NORMAL running, never a reason to lose a fit
+        if self.output_dir:
+            try:
+                self.save_outputs(fit_result=fit_result)
+            except Exception as e:
+                print(f'WARN: could not write outputs to {self.output_dir}: {e!r}')
+        return fit_result

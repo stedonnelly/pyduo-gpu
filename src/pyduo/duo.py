@@ -232,6 +232,9 @@ class DuoSolver:
                 node_check=getattr(self, 'node_check', 'flagged'))
             # [phase F] Hellmann-Feynman gradient support
             self.hamiltonian.capture_blocks = getattr(self, 'capture_blocks', False)
+            # [phase 2] structure-factor assembly (tools/gate_sf.py gates)
+            self.hamiltonian.use_structure_factors = getattr(
+                self, 'use_structure_factors', True)
 
         # Solve vibrational problem
         self._solve_vibrational()
@@ -350,9 +353,15 @@ class DuoSolver:
 
         self.hamiltonian.solve_vibrational_problem(max_vib_states=max_vib, max_energy=max_energy if max_energy else None)
 
-        # Store results
-        for istate in range(len(self.states)):
-            energies, wfs = self.hamiltonian.build_vibrational_hamiltonian(istate)
+        # Store results -- reuse the solutions solve_vibrational_problem just
+        # computed instead of re-diagonalizing every state (2x vib cost)
+        vib_sols = getattr(self.hamiltonian, '_vib_solutions', {})
+        for istate, state in enumerate(self.states):
+            sol = vib_sols.get(state.istate)
+            if sol is None:
+                energies, wfs = self.hamiltonian.build_vibrational_hamiltonian(istate)
+            else:
+                energies, wfs = sol[0], sol[1]
             self.vibrational_energies[istate] = energies
             self.vibrational_wavefunctions[istate] = wfs
 
